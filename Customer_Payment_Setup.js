@@ -1,21 +1,31 @@
 /**
  * Custom GL Lines Plug-in - SuiteScript 1.0
  *
- * Uses a transaction summary search to find Customer Payment debit lines
- * where the posting account is configured for AR clearing:
+ * Uses transaction summary searches to find:
+ * Customer Payment debit lines where the posting account is configured for AR clearing:
  *   account.custrecord_hfc_ar_clearing_flow    = T
  *   account.custrecord_hfc_ar_clearing_account is not empty
+ * Vendor Payment credit lines where the posting account has AP clearing account:
+ *   account.custrecord_hfc_ap_clearing_account is not empty
  *
- * Existing Standard GL:
+ * Existing Customer Payment Standard GL:
  *   Debit  account flagged for AR clearing flow    100
  *
- * Custom GL Added:
+ * Customer Payment Custom GL Added:
  *   Credit flagged source account                  100
  *   Debit  configured AR clearing account          100
+ *
+ * Existing Vendor Payment Standard GL:
+ *   Credit account with AP clearing account        100
+ *
+ * Vendor Payment Custom GL Added:
+ *   Debit  source account                          100
+ *   Credit configured AP clearing account          100
  */
 
 var CLEARING_FLOW_FIELD_ID = 'custrecord_hfc_ar_clearing_flow';
 var CLEARING_ACCOUNT_FIELD_ID = 'custrecord_hfc_ar_clearing_account';
+var AP_CLEARING_ACCOUNT_FIELD_ID = 'custrecord_hfc_ap_clearing_account';
 
 function customizeGlImpact(transactionRecord, standardLines, customLines, book) {
     try {
@@ -24,23 +34,25 @@ function customizeGlImpact(transactionRecord, standardLines, customLines, book) 
 
         nlapiLogExecution('DEBUG', 'Custom GL Start', 'Type: ' + recType + ' | ID: ' + recId);
 
-        if (recType !== 'customerpayment') {
-            nlapiLogExecution('DEBUG', 'Skipped', 'Not a Customer Payment.');
+        if (recType !== 'customerpayment' && recType !== 'vendorpayment') {
+            nlapiLogExecution('DEBUG', 'Skipped', 'Not a Customer Payment or Vendor Payment.');
             return;
         }
 
         if (isEmpty(recId)) {
-            nlapiLogExecution('DEBUG', 'Skipped', 'Customer Payment ID is empty.');
+            nlapiLogExecution('DEBUG', 'Skipped', 'Transaction ID is empty.');
             return;
         }
 
-        var adjustments = getDebitAdjustmentsFromSearch(recId);
+        var adjustments = recType === 'customerpayment' ?
+            getDebitAdjustmentsFromSearch(recId) :
+            getVendorPaymentCreditAdjustmentsFromSearch(recId);
 
         if (adjustments.length <= 0) {
             nlapiLogExecution(
                 'DEBUG',
                 'Skipped',
-                'No debit amount found for any account flagged with ' + CLEARING_FLOW_FIELD_ID
+                'No clearing adjustment found for transaction ID ' + recId
             );
             return;
         }
@@ -56,41 +68,63 @@ function customizeGlImpact(transactionRecord, standardLines, customLines, book) 
                 continue;
             }
 
-            /*
-             * Add Custom Credit Line:
-             * Credit source account from the standard GL line.
-             */
-            var creditLine = customLines.addNewLine();
-            creditLine.setAccountId(Number(adjustment.sourceAccountId));
-            creditLine.setCreditAmount(adjustmentAmount);
-            creditLine.setMemo('Offset Customer Payment debit from account ' + adjustment.sourceAccountId);
+            if (recType === 'customerpayment') {
+                var creditLine = customLines.addNewLine();
+                creditLine.setAccountId(Number(adjustment.sourceAccountId));
+                creditLine.setCreditAmount(adjustmentAmount);
+                creditLine.setMemo('Offset Customer Payment debit from account ' + adjustment.sourceAccountId);
 
-            setCommonValues(
-                creditLine,
-                adjustment.entityId,
-                adjustment.departmentId,
-                adjustment.classId,
-                adjustment.locationId,
-                adjustment.projectId
-            );
+                setCommonValues(
+                    creditLine,
+                    adjustment.entityId,
+                    adjustment.departmentId,
+                    adjustment.classId,
+                    adjustment.locationId,
+                    adjustment.projectId
+                );
 
-            /*
-             * Add Custom Debit Line:
-             * Debit configured AR clearing account.
-             */
-            var debitLine = customLines.addNewLine();
-            debitLine.setAccountId(Number(adjustment.clearingAccountId));
-            debitLine.setDebitAmount(adjustmentAmount);
-            debitLine.setMemo('Move Customer Payment amount to AR Clearing');
+                var debitLine = customLines.addNewLine();
+                debitLine.setAccountId(Number(adjustment.clearingAccountId));
+                debitLine.setDebitAmount(adjustmentAmount);
+                debitLine.setMemo('Move Customer Payment amount to AR Clearing');
 
-            setCommonValues(
-                debitLine,
-                adjustment.entityId,
-                adjustment.departmentId,
-                adjustment.classId,
-                adjustment.locationId,
-                adjustment.projectId
-            );
+                setCommonValues(
+                    debitLine,
+                    adjustment.entityId,
+                    adjustment.departmentId,
+                    adjustment.classId,
+                    adjustment.locationId,
+                    adjustment.projectId
+                );
+            } else {
+                var sourceDebitLine = customLines.addNewLine();
+                sourceDebitLine.setAccountId(Number(adjustment.sourceAccountId));
+                sourceDebitLine.setDebitAmount(adjustmentAmount);
+                sourceDebitLine.setMemo('Offset Vendor Payment credit from account ' + adjustment.sourceAccountId);
+
+                setCommonValues(
+                    sourceDebitLine,
+                    adjustment.entityId,
+                    adjustment.departmentId,
+                    adjustment.classId,
+                    adjustment.locationId,
+                    adjustment.projectId
+                );
+
+                var clearingCreditLine = customLines.addNewLine();
+                clearingCreditLine.setAccountId(Number(adjustment.clearingAccountId));
+                clearingCreditLine.setCreditAmount(adjustmentAmount);
+                clearingCreditLine.setMemo('Move Vendor Payment amount to AP Clearing');
+
+                setCommonValues(
+                    clearingCreditLine,
+                    adjustment.entityId,
+                    adjustment.departmentId,
+                    adjustment.classId,
+                    adjustment.locationId,
+                    adjustment.projectId
+                );
+            }
 
             totalAdjustedAmount += adjustmentAmount;
             addedAdjustmentCount++;
@@ -108,7 +142,9 @@ function customizeGlImpact(transactionRecord, standardLines, customLines, book) 
         nlapiLogExecution(
             'AUDIT',
             'Custom GL Lines Added',
-            'Adjustment Count: ' + addedAdjustmentCount +
+            'Type: ' + recType +
+            ' | ID: ' + recId +
+            ' | Adjustment Count: ' + addedAdjustmentCount +
             ' | Total Amount: ' + roundAmount(totalAdjustedAmount)
         );
 
@@ -208,6 +244,97 @@ function getDebitAdjustmentsFromSearch(paymentId) {
         nlapiLogExecution(
             'ERROR',
             'Clearing Flow Search Error',
+            'Name: ' + e.name + ' | Message: ' + e.message
+        );
+    }
+
+    return adjustments;
+}
+
+/**
+ * Summary search for Vendor Payment cash/clearing credit lines.
+ */
+function getVendorPaymentCreditAdjustmentsFromSearch(paymentId) {
+    var adjustments = [];
+
+    try {
+        var filters = [];
+
+        filters.push(new nlobjSearchFilter('type', null, 'anyof', 'VendPymt'));
+        filters.push(new nlobjSearchFilter(AP_CLEARING_ACCOUNT_FIELD_ID, 'account', 'noneof', '@NONE@'));
+        filters.push(new nlobjSearchFilter('internalid', null, 'anyof', String(paymentId)));
+
+        var columns = [];
+
+        columns.push(new nlobjSearchColumn('internalid', null, 'GROUP'));
+        columns.push(new nlobjSearchColumn('creditamount', null, 'SUM'));
+        columns.push(new nlobjSearchColumn('internalid', 'account', 'MAX'));
+        columns.push(new nlobjSearchColumn(AP_CLEARING_ACCOUNT_FIELD_ID, 'account', 'GROUP'));
+        columns.push(new nlobjSearchColumn('memo', null, 'GROUP'));
+        columns.push(new nlobjSearchColumn('location', null, 'GROUP'));
+        columns.push(new nlobjSearchColumn('department', null, 'GROUP'));
+        columns.push(new nlobjSearchColumn('class', null, 'GROUP'));
+        columns.push(new nlobjSearchColumn('cseg1', null, 'GROUP'));
+        columns.push(new nlobjSearchColumn('entity', null, 'GROUP'));
+
+        var results = nlapiSearchRecord('vendorpayment', null, filters, columns);
+
+        if (!results || results.length <= 0) {
+            nlapiLogExecution(
+                'DEBUG',
+                'AP Clearing Search Result',
+                'No search result found for vendor payment ID ' + paymentId
+            );
+            return adjustments;
+        }
+
+        nlapiLogExecution(
+            'DEBUG',
+            'AP Clearing Search Result Count',
+            results.length
+        );
+
+        for (var i = 0; i < results.length; i++) {
+            var amount = roundAmount(getSummaryValue(results[i], columns[1], 'creditamount', null, 'SUM'));
+            var accountId = toNumber(getSummaryValue(results[i], columns[2], 'internalid', 'account', 'MAX'));
+            var clearingAccountId = toNumber(getSummaryValue(results[i], columns[3], AP_CLEARING_ACCOUNT_FIELD_ID, 'account', 'GROUP'));
+
+            if (amount <= 0 || accountId <= 0 || clearingAccountId <= 0) {
+                nlapiLogExecution(
+                    'DEBUG',
+                    'AP Clearing Search Line Skipped',
+                    'Amount: ' + amount +
+                    ' | Account: ' + accountId +
+                    ' | Clearing Account: ' + clearingAccountId
+                );
+                continue;
+            }
+
+            nlapiLogExecution(
+                'DEBUG',
+                'AP Clearing Search Line',
+                'Account: ' + accountId +
+                ' | Credit Amount: ' + amount +
+                ' | Clearing Account: ' + clearingAccountId
+            );
+
+            adjustments.push({
+                sourceAccountId: accountId,
+                clearingAccountId: clearingAccountId,
+                amount: amount,
+                memo: getSummaryValue(results[i], columns[4], 'memo', null, 'GROUP'),
+                locationId: getSummaryValue(results[i], columns[5], 'location', null, 'GROUP'),
+                departmentId: getSummaryValue(results[i], columns[6], 'department', null, 'GROUP') || 1,
+                classId: getSummaryValue(results[i], columns[7], 'class', null, 'GROUP'),
+                projectId: getSummaryValue(results[i], columns[8], 'cseg1', null, 'GROUP'),
+                entityId: getSummaryValue(results[i], columns[9], 'entity', null, 'GROUP')
+            });
+        }
+
+    } catch (e) {
+        nlapiLogExecution(
+            'ERROR',
+            'AP Clearing Search Error',
             'Name: ' + e.name + ' | Message: ' + e.message
         );
     }

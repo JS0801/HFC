@@ -2,16 +2,195 @@
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
  */
-define(['N/file', 'N/search', 'N/record', 'N/format'], function (file, search, record, format) {
+define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (file, search, record, format, runtime) {
     var RETURN_FOLDER_ID = '329224';
-    var PROCESSED_FOLDERID = '329225';
+    var PROCESSED_FOLDER_ID = '329225';
+    var DUPLICATE_FOLDER_ID = '398330';
+    var FILE_ID_PARAM = 'custscript_fileid';
     var DAYS_BACK = 30;
     var BATCH_FIELD = 'custbody_9997_pfa_record';
     var OPERATING_SEQ_FIELD = 'custitem_operating_seq';
     var NAF_SEQ_FIELD = 'custitem_naf_seq';
     var VOID_MEMO_TEXT = 'ACH RETURN VOIDED';
+    var AP_MEMO_TEXT = 'NSF Bill Payment Reversal';
+    var UNAPPLIED_DATE_FIELD = 'custbody_datetimeunapplied';
+    var PROCESS_CUSTOMER = 'CUSTOMER_PAYMENT';
+    var PROCESS_BILL = 'BILL_PAYMENT';
 
     function getInputData() {
+        var fileObj = getReturnFile();
+
+        if (!fileObj) return [];
+
+        if (isDuplicateFile(fileObj.name)) {
+            fileObj.description = 'Duplicate';
+            fileObj.folder = DUPLICATE_FOLDER_ID;
+            fileObj.save();
+
+            log.audit('ACH Return Duplicate File Moved', {
+                fileId: fileObj.id,
+                fileName: fileObj.name,
+                movedToFolder: DUPLICATE_FOLDER_ID
+            });
+
+            return [];
+        }
+
+        var rows = parseCsv(fileObj.getContents());
+        var failedLookup = getReturnedPayments(rows, fileObj.id, fileObj.name);
+        var failedRefs = Object.keys(failedLookup);
+
+        log.audit('ACH Return CSV Loaded', {
+            fileId: fileObj.id,
+            fileName: fileObj.name,
+            rows: rows.length,
+            failedRefs: failedRefs.length,
+            failedAmount: failedRefs.reduce(function (total, ref) {
+                return round(total + failedLookup[ref].returnedAmount);
+            }, 0)
+        });
+
+        if (!failedRefs.length) return [];
+
+        var tranLookup = findReturnedTransactions(failedLookup);
+        var customerFailedLookup = {};
+        var billPaymentArray = [];
+        var inputErrors = [];
+
+        failedRefs.forEach(function (ref) {
+            var failed = failedLookup[ref];
+            var tran = tranLookup[ref];
+
+            if (!tran) {
+                inputErrors.push(ref + ' not found');
+                log.error('ACH Return Payment Not Found', {
+                    paymentRef: ref,
+                    amount: failed.returnedAmount,
+                    daysBack: DAYS_BACK
+                });
+                return;
+            }
+
+            if (tran.multiple) {
+                inputErrors.push(ref + ' multiple matches');
+                log.error('ACH Return Payment Multiple Matches', {
+                    paymentRef: ref,
+                    matches: tran.matches
+                });
+                return;
+            }
+
+            if (tran.processType === PROCESS_CUSTOMER) {
+                failed.paymentRef = tran.tranId || ref;
+                failed.csvPaymentRef = ref;
+                customerFailedLookup[failed.paymentRef] = failed;
+            } else if (tran.processType === PROCESS_BILL) {
+                billPaymentArray.push({
+                    processType: PROCESS_BILL,
+                    fileId: String(fileObj.id),
+                    fileName: fileObj.name,
+                    paymentId: tran.paymentId,
+                    paymentRef: tran.tranId || ref,
+                    csvPaymentRef: ref,
+                    returnedAmount: failed.returnedAmount,
+                    returnCode: failed.returnCode,
+                    returnReason: failed.returnReason
+                });
+            }
+        });
+
+        if (inputErrors.length) {
+            throw new Error('ACH Return input has unresolved payment refs: ' + inputErrors.slice(0, 25).join('; '));
+        }
+
+        var customerPaymentArray = buildCustomerPaymentGroups(customerFailedLookup, fileObj.id, fileObj.name);
+        var output = customerPaymentArray.concat(billPaymentArray);
+
+        log.audit('ACH Return Input Prepared', {
+            customerGroups: customerPaymentArray.length,
+            billPayments: billPaymentArray.length,
+            totalMapItems: output.length
+        });
+
+        return output.map(function (item) {
+            return JSON.stringify(item);
+        });
+    }
+
+    function map(context) {
+        var data = JSON.parse(context.value);
+
+        if (data.processType === PROCESS_CUSTOMER) {
+            processCustomerPaymentGroup(data);
+            context.write({ key: 'fileId', value: data.fileId });
+            return;
+        }
+
+        if (data.processType === PROCESS_BILL) {
+            var result = createBillPaymentJeAndApply(data.paymentId, data.returnedAmount, data.paymentRef);
+
+            log.audit('Bill Payment Return Processed', {
+                paymentId: data.paymentId,
+                paymentRef: data.paymentRef,
+                csvPaymentRef: data.csvPaymentRef,
+                returnedAmount: data.returnedAmount,
+                journalId: result.journalId,
+                savedPaymentId: result.paymentId
+            });
+
+            context.write({ key: 'fileId', value: data.fileId });
+            return;
+        }
+
+        throw new Error('Unknown process type: ' + data.processType);
+    }
+
+    function summarize(summary) {
+        var hasErrors = false;
+        var fileIds = {};
+
+        if (summary.inputSummary.error) {
+            hasErrors = true;
+            log.error('ACH Return Input Error', summary.inputSummary.error);
+        }
+
+        summary.mapSummary.errors.iterator().each(function (key, errorText) {
+            hasErrors = true;
+            log.error('ACH Return Map Error', key + ': ' + errorText);
+            return true;
+        });
+
+        summary.output.iterator().each(function (key, value) {
+            if (value) fileIds[value] = true;
+            return true;
+        });
+
+        if (hasErrors) {
+            log.audit('ACH Return Complete With Errors', {
+                filesTouched: Object.keys(fileIds)
+            });
+            return;
+        }
+
+        Object.keys(fileIds).forEach(function (fileId) {
+            var fileObj = file.load({ id: fileId });
+
+            fileObj.description = 'Completed';
+            fileObj.folder = PROCESSED_FOLDER_ID;
+            fileObj.save();
+
+            log.audit('ACH Return File Completed', {
+                fileId: fileId,
+                movedToFolder: PROCESSED_FOLDER_ID
+            });
+        });
+    }
+
+    function getReturnFile() {
+        var fileId = runtime.getCurrentScript().getParameter({ name: FILE_ID_PARAM });
+
+        if (fileId) return file.load({ id: fileId });
+
         var latest = search.create({
             type: 'file',
             filters: [
@@ -28,92 +207,224 @@ define(['N/file', 'N/search', 'N/record', 'N/format'], function (file, search, r
 
         if (!latest) {
             log.audit('ACH Return', 'No CSV file found in folder ' + RETURN_FOLDER_ID);
-            return [];
+            return null;
         }
 
-        var csvFileId = latest.getValue({ name: 'internalid' });
-        var csvName = latest.getValue({ name: 'name' });
-        var fileObj = file.load({ id: csvFileId });
-        var rows = parseCsv(fileObj.getContents());
-        var failedLookup = {};
-        var failedCsvTotal = 0;
-
-        // rows.forEach(function (row) {
-        //     var ref = String(row['Recipient ID'] || '').trim();
-        //     var returnedAmount = money(row['Debit Amount']);
-
-        //     if (ref && returnedAmount > 0) {
-        //         failedLookup[ref] = {
-        //             paymentRef: ref,
-        //             returnedAmount: returnedAmount,
-        //             returnCode: String(row['Return Reason Code'] || '').trim(),
-        //             returnReason: String(row['Return Reason Description'] || '').trim()
-        //         };
-        //         failedCsvTotal = round(failedCsvTotal + returnedAmount);
-        //     }
-        // });
-
-
-        var pendingReturnRow = null;
-
-rows.forEach(function (row) {
-    var recipientId = String(row['Recipient ID'] || '').trim();
-    var returnedAmount = money(row['Debit Amount']);
-    var addenda = String(row['Addenda'] || '').trim();
-    var paymentMatch = addenda.match(/TRANSACTION REFERENCE:\s*(PYMT[0-9A-Za-z_-]+)/i);
-    var ref = recipientId.indexOf('PYMT') === 0 ? recipientId : '';
-
-    if (ref && returnedAmount > 0) {
-        failedLookup[ref] = {
-            paymentRef: ref,
-            returnedAmount: returnedAmount,
-            returnCode: String(row['Return Reason Code'] || '').trim(),
-            returnReason: String(row['Return Reason Description'] || '').trim()
-        };
-        failedCsvTotal = round(failedCsvTotal + returnedAmount);
-        pendingReturnRow = null;
-        return;
+        return file.load({ id: latest.getValue({ name: 'internalid' }) });
     }
 
-    if (!recipientId && paymentMatch && pendingReturnRow) {
-        ref = paymentMatch[1];
+    function getReturnedPayments(rows, fileId, fileName) {
+        var paymentMap = {};
 
-        failedLookup[ref] = {
-            paymentRef: ref,
-            returnedAmount: pendingReturnRow.returnedAmount,
-            returnCode: pendingReturnRow.returnCode,
-            returnReason: pendingReturnRow.returnReason
-        };
-        failedCsvTotal = round(failedCsvTotal + pendingReturnRow.returnedAmount);
-        pendingReturnRow = null;
-        return;
-    }
+        rows.forEach(function (row, index) {
+            var returnDesc = String(row['Return Type Desc'] || row.cols[7] || '').trim();
+            var returnedAmount = money(row['Debit Amount']) ||
+                money(row['Returned Amount']) ||
+                money(row['Credit Amount']) ||
+                money(row['Original Amount']) ||
+                money(row.cols[10]) ||
+                money(row.cols[35]);
 
-    if (returnedAmount > 0) {
-        pendingReturnRow = {
-            returnedAmount: returnedAmount,
-            returnCode: String(row['Return Reason Code'] || '').trim(),
-            returnReason: String(row['Return Reason Description'] || '').trim()
-        };
-    }
-});
+            if (returnDesc && returnDesc.toLowerCase() !== 'return') return;
+            if (returnedAmount <= 0) return;
 
+            var paymentRef = getPaymentReference(row, rows[index + 1]);
 
-      log.debug('failedLookup', failedLookup) 
+            if (!paymentRef) {
+                log.error('ACH Return Reference Missing', {
+                    fileId: fileId,
+                    fileName: fileName,
+                    row: row.rowNumber,
+                    amount: returnedAmount
+                });
+                return;
+            }
 
-        var failedRefs = Object.keys(failedLookup);
-        log.audit('ACH Return CSV Loaded', {
-            fileId: csvFileId,
-            fileName: csvName,
-            rows: rows.length,
-            failedRefs: failedRefs.length,
-            failedCsvTotal: failedCsvTotal
+            if (!paymentMap[paymentRef]) {
+                paymentMap[paymentRef] = {
+                    fileId: String(fileId),
+                    fileName: fileName,
+                    paymentRef: paymentRef,
+                    returnedAmount: 0,
+                    returnCode: String(row['Return Reason Code'] || row['Local Return Code'] || row.cols[20] || '').trim(),
+                    returnReason: String(row['Return Reason Description'] || row['Local Return Reason'] || row.cols[21] || '').trim()
+                };
+            }
+
+            paymentMap[paymentRef].returnedAmount = round(paymentMap[paymentRef].returnedAmount + returnedAmount);
         });
 
-        if (!failedRefs.length) return [];
+        log.debug('ACH Return Failed Payments Parsed', {
+            refs: Object.keys(paymentMap).length,
+            sampleRefs: Object.keys(paymentMap).slice(0, 25)
+        });
 
+        return paymentMap;
+    }
+
+    function getPaymentReference(row, nextRow) {
+        var recipientId = clean(row['Recipient ID'] || row.cols[11]);
+        var alternateId = clean(row.cols[12]);
+        var addenda = clean(row['Addenda'] || row.cols[25]);
+        var nextRecipientId = nextRow ? clean(nextRow['Recipient ID'] || nextRow.cols[11]) : '';
+        var nextAddenda = nextRow ? clean(nextRow['Addenda'] || nextRow.cols[25]) : '';
+        var match = null;
+
+        if (!nextRecipientId && nextAddenda) match = nextAddenda.match(/TRANSACTION REFERENCE:\s*([^\s,]+)/i);
+        if (!match && addenda) match = addenda.match(/TRANSACTION REFERENCE:\s*([^\s,]+)/i);
+        if (match) return clean(match[1]);
+        if (/CUSTOMER REFERENCE:/i.test(addenda)) return '';
+        if (recipientId) return recipientId;
+        return alternateId;
+    }
+
+    function findReturnedTransactions(failedLookup) {
+        var tranLookup = {};
+
+        runPaged(search.create({
+            type: 'transaction',
+            settings: [{ name: 'consolidationtype', value: 'ACCTTYPE' }],
+            filters: [
+                ['type', 'anyof', 'CustPymt', 'VendPymt'],
+                'AND',
+                ['mainline', 'is', 'T'],
+                'AND',
+                ['trandate', 'within', 'daysago' + DAYS_BACK, 'daysago0']
+            ],
+            columns: [
+                'internalid',
+                'tranid',
+                'recordtype',
+                'type'
+            ]
+        }), function (result) {
+            var tranId = clean(result.getValue({ name: 'tranid' }));
+
+            if (failedLookup[tranId]) {
+                addTransactionMatch(tranLookup, tranId, {
+                    paymentId: String(result.getValue({ name: 'internalid' })),
+                    tranId: tranId,
+                    recordType: result.getValue({ name: 'recordtype' }),
+                    typeValue: result.getValue({ name: 'type' }),
+                    processType: getProcessType(result.getValue({ name: 'recordtype' }), result.getValue({ name: 'type' }))
+                });
+            }
+        });
+
+        Object.keys(failedLookup).forEach(function (ref) {
+            if (!tranLookup[ref]) {
+                var fallback = findTransactionByReference(ref);
+
+                if (fallback) addTransactionMatch(tranLookup, ref, fallback);
+            }
+        });
+
+        log.audit('ACH Return Transactions Identified', {
+            failedRefs: Object.keys(failedLookup).length,
+            matchedRefs: Object.keys(tranLookup).length
+        });
+
+        return tranLookup;
+    }
+
+    function findTransactionByReference(paymentRef) {
+        var results = search.create({
+            type: 'transaction',
+            settings: [{ name: 'consolidationtype', value: 'ACCTTYPE' }],
+            filters: [
+                ['type', 'anyof', 'CustPymt', 'VendPymt'],
+                'AND',
+                ['mainline', 'is', 'T'],
+                'AND',
+                ['trandate', 'within', 'daysago' + DAYS_BACK, 'daysago0'],
+                'AND',
+                [
+                    ['numbertext', 'is', paymentRef],
+                    'OR',
+                    ['tranid', 'is', paymentRef]
+                ]
+            ],
+            columns: [
+                'internalid',
+                'tranid',
+                'recordtype',
+                'type'
+            ]
+        }).run().getRange({ start: 0, end: 3 });
+
+        if (!results || !results.length) return null;
+
+        if (results.length > 1) {
+            return {
+                multiple: true,
+                matches: results.map(function (result) {
+                    return {
+                        paymentId: result.getValue({ name: 'internalid' }),
+                        tranId: result.getValue({ name: 'tranid' }),
+                        recordType: result.getValue({ name: 'recordtype' })
+                    };
+                })
+            };
+        }
+
+        return {
+            paymentId: String(results[0].getValue({ name: 'internalid' })),
+            tranId: clean(results[0].getValue({ name: 'tranid' })) || paymentRef,
+            recordType: results[0].getValue({ name: 'recordtype' }),
+            typeValue: results[0].getValue({ name: 'type' }),
+            processType: getProcessType(results[0].getValue({ name: 'recordtype' }), results[0].getValue({ name: 'type' }))
+        };
+    }
+
+    function addTransactionMatch(tranLookup, ref, tran) {
+        if (!tran) return;
+
+        if (tran.multiple) {
+            tranLookup[ref] = tran;
+            return;
+        }
+
+        if (!tran.processType) return;
+
+        if (tranLookup[ref] && tranLookup[ref].paymentId !== tran.paymentId) {
+            var existing = tranLookup[ref];
+
+            tranLookup[ref] = {
+                multiple: true,
+                matches: [
+                    {
+                        paymentId: existing.paymentId,
+                        tranId: existing.tranId,
+                        recordType: existing.recordType
+                    },
+                    {
+                        paymentId: tran.paymentId,
+                        tranId: tran.tranId,
+                        recordType: tran.recordType
+                    }
+                ]
+            };
+            return;
+        }
+
+        tranLookup[ref] = tran;
+    }
+
+    function getProcessType(recordType, typeValue) {
+        var recordTypeText = String(recordType || '').toLowerCase();
+        var typeText = String(typeValue || '');
+
+        if (recordTypeText === 'customerpayment' || typeText === 'CustPymt') return PROCESS_CUSTOMER;
+        if (recordTypeText === 'vendorpayment' || typeText === 'VendPymt') return PROCESS_BILL;
+        return '';
+    }
+
+    function buildCustomerPaymentGroups(customerFailedLookup, fileId, fileName) {
+        var failedRefs = Object.keys(customerFailedLookup);
         var groups = {};
         var foundFailedRefs = {};
+
+        if (!failedRefs.length) return [];
 
         runPaged(search.create({
             type: 'customerpayment',
@@ -140,7 +451,7 @@ rows.forEach(function (row) {
             ]
         }), function (result) {
             var paymentId = String(result.getValue({ name: 'internalid' }));
-            var ref = String(result.getValue({ name: 'tranid' }) || '').trim();
+            var ref = clean(result.getValue({ name: 'tranid' }));
             var batchId = result.getValue({ name: BATCH_FIELD });
             var customerId = result.getValue({ name: 'entity' });
             var accountId = result.getValue({ name: 'account' });
@@ -148,13 +459,16 @@ rows.forEach(function (row) {
             var paymentAmount = Math.abs(money(result.getValue({ name: 'amount' })));
             var invoiceId = result.getValue({ name: 'appliedtotransaction' });
             var appliedAmount = Math.abs(money(result.getValue({ name: 'appliedtolinkamount' })));
-            var failed = failedLookup[ref];
+            var failed = customerFailedLookup[ref];
             var key = [batchId, customerId, accountId].join('_');
 
             if (!paymentId || !batchId || !customerId || !accountId || !paymentAmount || !invoiceId || !appliedAmount) return;
 
             if (!groups[key]) {
                 groups[key] = {
+                    processType: PROCESS_CUSTOMER,
+                    fileId: String(fileId),
+                    fileName: fileName,
                     key: key,
                     batchId: String(batchId),
                     customerId: String(customerId),
@@ -187,14 +501,13 @@ rows.forEach(function (row) {
                 groups[key].totals.batchAmount = round(groups[key].totals.batchAmount + paymentAmount);
 
                 if (failed) {
-                    foundFailedRefs[ref] = true;
+                    foundFailedRefs[failed.csvPaymentRef || ref] = true;
                     payment.returnedAmount = failed.returnedAmount;
                     payment.returnCode = failed.returnCode;
                     payment.returnReason = failed.returnReason;
                     groups[key].failedPayments.push(payment);
-                    groups[key].totals.failedAmount = round(groups[key].totals.failedAmount + failed.returnedAmount);
 
-                    log.debug('ACH Failed Payment Matched', {
+                    log.debug('Customer Failed Payment Matched', {
                         key: key,
                         paymentId: paymentId,
                         paymentRef: ref,
@@ -221,126 +534,84 @@ rows.forEach(function (row) {
 
             if (!group.failedPayments.length) return list;
 
+            group.totals.failedAmount = group.failedPayments.reduce(function (total, payment) {
+                return round(total + money(payment.returnedAmount));
+            }, 0);
             group.totals.availableAmount = Math.max(0, round(group.totals.batchAmount - group.totals.failedAmount));
 
-            log.debug('ACH Group Prepared', {
-                key: key,
-                batchId: group.batchId,
-                customerId: group.customerId,
-                accountId: group.accountId,
-                passedPayments: group.passedPayments.length,
-                failedPayments: group.failedPayments.length,
-                invoiceCount: Object.keys(group.invoiceAmounts).length,
-                batchAmount: group.totals.batchAmount,
-                failedAmount: group.totals.failedAmount,
-                availableAmount: group.totals.availableAmount
-            });
-
+            prepareCustomerAllocation(group);
             delete group.paymentMap;
-            list.push(JSON.stringify(group));
+            list.push(group);
             return list;
         }, []);
 
-        var missingRefs = failedRefs.filter(function (ref) { return !foundFailedRefs[ref]; });
-
-        log.audit('ACH Return Groups Built', {
-            groups: output.length,
-            unmatchedFailedRefs: missingRefs.length,
-            unmatchedRefs: missingRefs.slice(0, 25)
+        var unmatchedRefs = failedRefs.filter(function (ref) {
+            return !foundFailedRefs[customerFailedLookup[ref].csvPaymentRef || ref];
         });
 
-        fileObj.folder = PROCESSED_FOLDERID;
-        fileObj.save();
-      
+        if (unmatchedRefs.length) {
+            throw new Error('Customer payments were found but not available in batch/apply search: ' + unmatchedRefs.slice(0, 25).join(', '));
+        }
+
+        log.audit('Customer Return Groups Built', {
+            groups: output.length,
+            unmatchedFailedRefs: unmatchedRefs
+        });
+
         return output;
     }
 
-    function map(context) {
-        var group = JSON.parse(context.value);
-        var payments = group.passedPayments.concat(group.failedPayments).sort(function (a, b) {
-            return dateTime(a.paymentDate) - dateTime(b.paymentDate) ||
-                String(a.paymentRef).localeCompare(String(b.paymentRef)) ||
-                Number(a.paymentId) - Number(b.paymentId);
-        });
-        var invoiceAmounts = group.invoiceAmounts || {};
-        var invoiceInfo = {};
-
+    function prepareCustomerAllocation(group) {
         var accountName = String(group.accountName || '');
         var itemSeqField = OPERATING_SEQ_FIELD;
+        var invoiceAmounts = group.invoiceAmounts || {};
+        var invoiceIds = Object.keys(invoiceAmounts);
+        var invoiceInfo = {};
 
         if (accountName.indexOf('- NAF - USD -') !== -1 || accountName.indexOf('- NAF - CAD -') !== -1) {
-           itemSeqField = NAF_SEQ_FIELD;
+            itemSeqField = NAF_SEQ_FIELD;
         }
 
-        log.audit('ACH Group Start', {
-            key: group.key,
-            accountName: accountName,
-            itemSeqField: itemSeqField,
-            batchId: group.batchId,
-            customerId: group.customerId,
-            accountId: group.accountId,
-            payments: payments.length,
-            failedPayments: group.failedPayments.length,
-            availableAmount: group.totals.availableAmount
-        });
-      
+        if (invoiceIds.length) {
+            runPaged(search.create({
+                type: search.Type.INVOICE,
+                filters: [
+                    ['internalid', 'anyof', invoiceIds],
+                    'AND',
+                    ['mainline', 'is', 'F'],
+                    'AND',
+                    ['taxline', 'is', 'F'],
+                    'AND',
+                    ['shipping', 'is', 'F'],
+                    'AND',
+                    ['cogs', 'is', 'F']
+                ],
+                columns: [
+                    'internalid',
+                    'tranid',
+                    'trandate',
+                    search.createColumn({ name: itemSeqField, join: 'item' })
+                ]
+            }), function (result) {
+                var invoiceId = String(result.getValue({ name: 'internalid' }));
+                var seqText = result.getValue({ name: itemSeqField, join: 'item' });
+                var seq = Number(String(seqText || '').replace(/,/g, ''));
 
-        var invoiceIds = Object.keys(invoiceAmounts);
-        var appliedTotal = invoiceIds.reduce(function (total, invoiceId) {
-            return round(total + invoiceAmounts[invoiceId]);
-        }, 0);
+                if (seqText === '' || seqText === null || isNaN(seq)) seq = 999999999;
 
-        log.audit('ACH Applied Invoices Loaded', {
-            key: group.key,
-            invoices: invoiceIds.length,
-            batchAmount: group.totals.batchAmount,
-            appliedInvoiceAmount: appliedTotal,
-            difference: round(group.totals.batchAmount - appliedTotal)
-        });
-
-        if (!invoiceIds.length) {
-            log.audit('ACH Group Skipped', 'No applied invoices found for ' + group.key);
-            return;
+                if (!invoiceInfo[invoiceId]) {
+                    invoiceInfo[invoiceId] = {
+                        invoiceId: invoiceId,
+                        invoiceNumber: result.getValue({ name: 'tranid' }),
+                        invoiceDate: result.getValue({ name: 'trandate' }),
+                        invoiceDateTime: dateTime(result.getValue({ name: 'trandate' })),
+                        itemSequence: seq
+                    };
+                } else if (seq < invoiceInfo[invoiceId].itemSequence) {
+                    invoiceInfo[invoiceId].itemSequence = seq;
+                }
+            });
         }
-
-        runPaged(search.create({
-            type: search.Type.INVOICE,
-            filters: [
-                ['internalid', 'anyof', invoiceIds],
-                'AND',
-                ['mainline', 'is', 'F'],
-                'AND',
-                ['taxline', 'is', 'F'],
-                'AND',
-                ['shipping', 'is', 'F'],
-                'AND',
-                ['cogs', 'is', 'F']
-            ],
-            columns: [
-                'internalid',
-                'tranid',
-                'trandate',
-                search.createColumn({ name: itemSeqField, join: 'item' })
-            ]
-        }), function (result) {
-            var invoiceId = String(result.getValue({ name: 'internalid' }));
-            var seqText = result.getValue({ name: itemSeqField, join: 'item' });
-            var seq = Number(String(seqText || '').replace(/,/g, ''));
-
-            if (seqText === '' || seqText === null || isNaN(seq)) seq = 999999999;
-
-            if (!invoiceInfo[invoiceId]) {
-                invoiceInfo[invoiceId] = {
-                    invoiceId: invoiceId,
-                    invoiceNumber: result.getValue({ name: 'tranid' }),
-                    invoiceDate: result.getValue({ name: 'trandate' }),
-                    invoiceDateTime: dateTime(result.getValue({ name: 'trandate' })),
-                    itemSequence: seq
-                };
-            } else if (seq < invoiceInfo[invoiceId].itemSequence) {
-                invoiceInfo[invoiceId].itemSequence = seq;
-            }
-        });
 
         invoiceIds.forEach(function (invoiceId) {
             if (!invoiceInfo[invoiceId]) {
@@ -363,13 +634,12 @@ rows.forEach(function (row) {
         var remaining = group.totals.availableAmount;
         var desiredByInvoice = {};
         var allocation = { full: 0, partial: 0, unpaid: 0 };
-        var allocationDetails = [];
+        var details = [];
 
         invoiceIds.forEach(function (invoiceId) {
             var currentAmount = invoiceAmounts[invoiceId];
-            var desiredAmount = Math.min(currentAmount, remaining);
+            var desiredAmount = round(Math.min(currentAmount, remaining));
 
-            desiredAmount = round(desiredAmount);
             desiredByInvoice[invoiceId] = desiredAmount;
             remaining = round(remaining - desiredAmount);
 
@@ -377,7 +647,7 @@ rows.forEach(function (row) {
             else if (desiredAmount > 0) allocation.partial++;
             else allocation.unpaid++;
 
-            allocationDetails.push({
+            details.push({
                 invoiceId: invoiceId,
                 invoiceNumber: invoiceInfo[invoiceId].invoiceNumber,
                 invoiceDate: invoiceInfo[invoiceId].invoiceDate,
@@ -387,18 +657,50 @@ rows.forEach(function (row) {
             });
         });
 
-        log.audit('ACH Allocation Built', {
+        group.itemSeqField = itemSeqField;
+        group.desiredByInvoice = desiredByInvoice;
+        group.allocation = allocation;
+        group.allocationDetails = details;
+
+        log.audit('Customer Allocation Prepared', {
             key: group.key,
+            itemSeqField: itemSeqField,
             invoices: invoiceIds.length,
             full: allocation.full,
             partial: allocation.partial,
             unpaid: allocation.unpaid,
             unusedAmount: remaining
         });
-        log.debug('ACH Allocation Detail', {
+        log.debug('Customer Allocation Detail', {
             key: group.key,
-            detailsShown: Math.min(allocationDetails.length, 25),
-            details: allocationDetails.slice(0, 25)
+            detailsShown: Math.min(details.length, 25),
+            details: details.slice(0, 25)
+        });
+    }
+
+    function processCustomerPaymentGroup(group) {
+        var desiredByInvoice = {};
+        var payments = group.passedPayments.concat(group.failedPayments).sort(function (a, b) {
+            return dateTime(a.paymentDate) - dateTime(b.paymentDate) ||
+                String(a.paymentRef).localeCompare(String(b.paymentRef)) ||
+                Number(a.paymentId) - Number(b.paymentId);
+        });
+
+        Object.keys(group.desiredByInvoice || {}).forEach(function (invoiceId) {
+            desiredByInvoice[invoiceId] = group.desiredByInvoice[invoiceId];
+        });
+
+        log.audit('Customer Group Start', {
+            key: group.key,
+            batchId: group.batchId,
+            customerId: group.customerId,
+            accountId: group.accountId,
+            accountName: group.accountName,
+            itemSeqField: group.itemSeqField,
+            payments: payments.length,
+            failedPayments: group.failedPayments.length,
+            availableAmount: group.totals.availableAmount,
+            allocation: group.allocation
         });
 
         payments.forEach(function (payment) {
@@ -416,7 +718,7 @@ rows.forEach(function (row) {
             var appliedBefore = 0;
             var hasOutsideApply = false;
 
-            log.debug('ACH Payment Edit Start', {
+            log.debug('Customer Payment Edit Start', {
                 paymentId: payment.paymentId,
                 paymentRef: payment.paymentRef,
                 bodyPaymentBefore: bodyPaymentBefore,
@@ -442,10 +744,10 @@ rows.forEach(function (row) {
 
                 invoiceId = String(invoiceId);
 
-                if (invoiceAmounts[invoiceId] === undefined) {
+                if ((group.invoiceAmounts || {})[invoiceId] === undefined) {
                     hasOutsideApply = true;
                     outsideAmount = round(outsideAmount + currentAmount);
-                    log.debug('ACH Apply Line Outside Group', {
+                    log.debug('Customer Apply Line Outside Group', {
                         paymentId: payment.paymentId,
                         paymentRef: payment.paymentRef,
                         line: i,
@@ -458,10 +760,9 @@ rows.forEach(function (row) {
                 hadGroupApply = true;
 
                 var desiredBefore = desiredByInvoice[invoiceId] || 0;
-                var allowedAmount = Math.min(currentAmount, desiredBefore);
+                var allowedAmount = round(Math.min(currentAmount, desiredBefore));
                 var lineChanged = false;
 
-                allowedAmount = round(allowedAmount);
                 desiredByInvoice[invoiceId] = round((desiredByInvoice[invoiceId] || 0) - allowedAmount);
                 keptGroupAmount = round(keptGroupAmount + allowedAmount);
 
@@ -476,7 +777,7 @@ rows.forEach(function (row) {
                     lineChanged = true;
                 }
 
-                log.debug('ACH Apply Line Decision', {
+                log.debug('Customer Apply Line Decision', {
                     paymentId: payment.paymentId,
                     paymentRef: payment.paymentRef,
                     line: i,
@@ -489,22 +790,27 @@ rows.forEach(function (row) {
                 });
             }
 
-            var targetAppliedAmount = round(keptGroupAmount + outsideAmount);
-var jeAmount = hadGroupApply ? round(bodyPaymentBefore - targetAppliedAmount) : 0;
-var returnJeId = '';
+            var bodyPaymentAfter = round(keptGroupAmount + outsideAmount);
 
-if (hadGroupApply && jeAmount > 0.009) {
-    changed = true;
-    log.debug('ACH Payment JE Needed', {
-        paymentId: payment.paymentId,
-        paymentRef: payment.paymentRef,
-        bodyPaymentBefore: bodyPaymentBefore,
-        targetAppliedAmount: targetAppliedAmount,
-        keptGroupAmount: keptGroupAmount,
-        outsideAmount: outsideAmount,
-        jeAmount: jeAmount
-    });
-}
+            if (hadGroupApply && bodyPaymentAfter > 0 && Math.abs(bodyPaymentBefore - bodyPaymentAfter) > 0.009) {
+                paymentRecord.setValue({ fieldId: 'payment', value: bodyPaymentAfter });
+                changed = true;
+                log.debug('Customer Payment Body Amount Set', {
+                    paymentId: payment.paymentId,
+                    paymentRef: payment.paymentRef,
+                    bodyPaymentBefore: bodyPaymentBefore,
+                    bodyPaymentAfter: bodyPaymentAfter,
+                    keptGroupAmount: keptGroupAmount,
+                    outsideAmount: outsideAmount
+                });
+            } else if (hadGroupApply && bodyPaymentAfter <= 0 && Math.abs(bodyPaymentBefore) > 0.009) {
+                log.debug('Customer Payment Body Amount Not Set To Zero', {
+                    paymentId: payment.paymentId,
+                    paymentRef: payment.paymentRef,
+                    bodyPaymentBefore: bodyPaymentBefore,
+                    bodyPaymentAfter: bodyPaymentAfter
+                });
+            }
 
             if (hadGroupApply && keptGroupAmount <= 0 && !hasOutsideApply) {
                 var memo = String(paymentRecord.getValue({ fieldId: 'memo' }) || '');
@@ -519,30 +825,19 @@ if (hadGroupApply && jeAmount > 0.009) {
             }
 
             if (changed) {
-log.debug('ACH Payment Save Attempt', {
-    paymentId: payment.paymentId,
-    paymentRef: payment.paymentRef,
-    bodyPaymentBefore: bodyPaymentBefore,
-    targetAppliedAmount: targetAppliedAmount,
-    jeAmount: jeAmount,
-    appliedBefore: appliedBefore,
-    keptGroupAmount: keptGroupAmount,
-    outsideAmount: outsideAmount,
-    hadGroupApply: hadGroupApply,
-    hasOutsideApply: hasOutsideApply
-});
+                log.debug('Customer Payment Save Attempt', {
+                    paymentId: payment.paymentId,
+                    paymentRef: payment.paymentRef,
+                    bodyPaymentBefore: bodyPaymentBefore,
+                    bodyPaymentAfter: bodyPaymentAfter,
+                    appliedBefore: appliedBefore,
+                    keptGroupAmount: keptGroupAmount,
+                    outsideAmount: outsideAmount,
+                    hadGroupApply: hadGroupApply,
+                    hasOutsideApply: hasOutsideApply
+                });
 
                 var savedId = paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: true });
-                if (jeAmount > 0.009) {
-    returnJeId = createAndApplyPaymentJe(savedId, jeAmount);
-
-    log.audit('ACH Return JE Applied', {
-        paymentId: savedId,
-        paymentRef: payment.paymentRef,
-        journalId: returnJeId,
-        jeAmount: jeAmount
-    });
-}
                 var savedRecord = record.load({
                     type: record.Type.CUSTOMER_PAYMENT,
                     id: savedId,
@@ -561,19 +856,18 @@ log.debug('ACH Payment Save Attempt', {
                     }
                 }
 
-                log.audit('ACH Payment Updated', {
-    paymentId: payment.paymentId,
-    paymentRef: payment.paymentRef,
-    keptAmount: keptGroupAmount,
-    bodyPaymentBefore: bodyPaymentBefore,
-    targetAppliedAmount: targetAppliedAmount,
-    savedBodyPayment: money(savedRecord.getValue({ fieldId: 'payment' })),
-    savedAppliedAmount: savedApplied,
-    returnJeId: returnJeId,
-    memoVoided: hadGroupApply && keptGroupAmount <= 0 && !hasOutsideApply
-});
+                log.audit('Customer Payment Updated', {
+                    paymentId: payment.paymentId,
+                    paymentRef: payment.paymentRef,
+                    keptAmount: keptGroupAmount,
+                    bodyPaymentBefore: bodyPaymentBefore,
+                    expectedBodyPayment: bodyPaymentAfter,
+                    savedBodyPayment: money(savedRecord.getValue({ fieldId: 'payment' })),
+                    savedAppliedAmount: savedApplied,
+                    memoVoided: hadGroupApply && keptGroupAmount <= 0 && !hasOutsideApply
+                });
             } else {
-                log.debug('ACH Payment No Change', {
+                log.debug('Customer Payment No Change', {
                     paymentId: payment.paymentId,
                     paymentRef: payment.paymentRef,
                     bodyPaymentBefore: bodyPaymentBefore,
@@ -595,11 +889,280 @@ log.debug('ACH Payment Save Attempt', {
             };
         });
 
-        log.audit('ACH Group Complete', {
+        log.audit('Customer Group Complete', {
             key: group.key,
             desiredLeftCount: desiredLeft.length,
             desiredLeft: desiredLeft.slice(0, 25)
         });
+    }
+
+    function createBillPaymentJeAndApply(paymentId, returnedAmount, paymentRef) {
+        var paymentRecord = record.load({
+            type: record.Type.VENDOR_PAYMENT,
+            id: paymentId,
+            isDynamic: false
+        });
+        var entityId = paymentRecord.getValue({ fieldId: 'entity' });
+        var subsidiaryId = paymentRecord.getValue({ fieldId: 'subsidiary' });
+        var currencyId = paymentRecord.getValue({ fieldId: 'currency' });
+        var mainAccountId = paymentRecord.getValue({ fieldId: 'account' });
+        var paymentTotal = round(money(paymentRecord.getValue({ fieldId: 'total' })));
+        var jeAmount = round(returnedAmount || paymentTotal);
+
+        if (jeAmount <= 0) throw new Error('JE amount is zero for Bill Payment ' + paymentId);
+
+        var jeLines = getBillPaymentJeLines(paymentId, mainAccountId, entityId, jeAmount);
+        var memoText = AP_MEMO_TEXT + ' - ' + paymentRef;
+        var jeRecord = record.create({
+            type: record.Type.JOURNAL_ENTRY,
+            isDynamic: true
+        });
+
+        jeRecord.setValue({ fieldId: 'subsidiary', value: subsidiaryId });
+        if (currencyId) jeRecord.setValue({ fieldId: 'currency', value: currencyId });
+        jeRecord.setValue({ fieldId: 'approvalstatus', value: 2 });
+        jeRecord.setValue({ fieldId: 'memo', value: memoText });
+
+        jeLines.forEach(function (line) {
+            if (!line.account || (!line.debit && !line.credit)) return;
+
+            jeRecord.selectNewLine({ sublistId: 'line' });
+            jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'linesubsidiary', value: subsidiaryId });
+            jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'account', value: line.account });
+            if (line.entity) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'entity', value: line.entity });
+            else jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'entity', value: entityId });
+            jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'memo', value: memoText });
+            if (line.department) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'department', value: line.department });
+            else jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'department', value: 1 });
+            if (line.classId) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'class', value: line.classId });
+            if (line.location) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'location', value: line.location });
+            if (line.debit) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'debit', value: line.debit });
+            if (line.credit) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'credit', value: line.credit });
+            jeRecord.commitLine({ sublistId: 'line' });
+        });
+
+        var jeId = jeRecord.save();
+        var savedPaymentId = applyBillPaymentToJe(paymentId, jeId, jeAmount);
+
+        log.audit('Bill Payment JE Created', {
+            paymentId: paymentId,
+            paymentRef: paymentRef,
+            paymentTotal: paymentTotal,
+            returnedAmount: returnedAmount,
+            jeAmount: jeAmount,
+            journalId: jeId,
+            lines: jeLines
+        });
+
+        return {
+            journalId: jeId,
+            paymentId: savedPaymentId
+        };
+    }
+
+    function getBillPaymentJeLines(paymentId, mainAccountId, entityId, jeAmount) {
+        var mainInfo = { account: mainAccountId, entity: entityId };
+        var lineMap = {};
+        var jeLines = [];
+        var sourceDebitTotal = 0;
+        var sourceCreditTotal = 0;
+
+        runPaged(search.create({
+            type: 'vendorpayment',
+            settings: [{ name: 'consolidationtype', value: 'ACCTTYPE' }],
+            filters: [
+                ['type', 'anyof', 'VendPymt'],
+                'AND',
+                ['internalid', 'anyof', paymentId]
+            ],
+            columns: [
+                'accountmain',
+                'account',
+                'entity',
+                'department',
+                'class',
+                'location',
+                'memo',
+                'debitfxamount',
+                'creditfxamount',
+                'debitamount',
+                'creditamount'
+            ]
+        }), function (result) {
+            var accountMain = result.getValue({ name: 'accountmain' }) || mainAccountId;
+            var lineAccount = result.getValue({ name: 'account' });
+            var debitAmount = money(result.getValue({ name: 'debitfxamount' })) ||
+                money(result.getValue({ name: 'debitamount' }));
+            var creditAmount = money(result.getValue({ name: 'creditfxamount' })) ||
+                money(result.getValue({ name: 'creditamount' }));
+            var lineEntity = result.getValue({ name: 'entity' }) || entityId;
+            var departmentId = result.getValue({ name: 'department' });
+            var classId = result.getValue({ name: 'class' });
+            var locationId = result.getValue({ name: 'location' });
+
+            if (!lineAccount || (!debitAmount && !creditAmount)) return;
+
+            if (String(accountMain) === String(lineAccount)) {
+                mainInfo = {
+                    account: accountMain,
+                    entity: lineEntity,
+                    department: departmentId,
+                    classId: classId,
+                    location: locationId
+                };
+                return;
+            }
+
+            var side = debitAmount > 0 ? 'C' : 'D';
+            var key = [lineAccount, lineEntity, departmentId || '', classId || '', locationId || '', side].join('|');
+
+            if (!lineMap[key]) {
+                lineMap[key] = {
+                    account: lineAccount,
+                    entity: lineEntity,
+                    department: departmentId,
+                    classId: classId,
+                    location: locationId,
+                    sourceDebit: 0,
+                    sourceCredit: 0,
+                    debit: 0,
+                    credit: 0
+                };
+                jeLines.push(lineMap[key]);
+            }
+
+            lineMap[key].sourceDebit = round(lineMap[key].sourceDebit + debitAmount);
+            lineMap[key].sourceCredit = round(lineMap[key].sourceCredit + creditAmount);
+            sourceDebitTotal = round(sourceDebitTotal + debitAmount);
+            sourceCreditTotal = round(sourceCreditTotal + creditAmount);
+        });
+
+        if (!jeLines.length) throw new Error('No non-main GL lines found for Bill Payment ' + paymentId);
+
+        scaleJeLines(jeLines, sourceDebitTotal, sourceCreditTotal, jeAmount);
+        balanceJeLines(jeLines, mainInfo);
+
+        log.debug('Bill Payment JE Lines Prepared', {
+            paymentId: paymentId,
+            mainAccountId: mainInfo.account,
+            jeAmount: jeAmount,
+            sourceDebitTotal: sourceDebitTotal,
+            sourceCreditTotal: sourceCreditTotal,
+            lines: jeLines
+        });
+
+        return jeLines;
+    }
+
+    function scaleJeLines(jeLines, sourceDebitTotal, sourceCreditTotal, jeAmount) {
+        var debitCreated = 0;
+        var creditCreated = 0;
+        var lastDebitLine = null;
+        var lastCreditLine = null;
+
+        jeLines.forEach(function (line) {
+            if (line.sourceCredit > 0 && sourceCreditTotal > 0) {
+                line.debit = round(line.sourceCredit / sourceCreditTotal * jeAmount);
+                debitCreated = round(debitCreated + line.debit);
+                lastDebitLine = line;
+            }
+
+            if (line.sourceDebit > 0 && sourceDebitTotal > 0) {
+                line.credit = round(line.sourceDebit / sourceDebitTotal * jeAmount);
+                creditCreated = round(creditCreated + line.credit);
+                lastCreditLine = line;
+            }
+        });
+
+        if (lastDebitLine) lastDebitLine.debit = round(lastDebitLine.debit + jeAmount - debitCreated);
+        if (lastCreditLine) lastCreditLine.credit = round(lastCreditLine.credit + jeAmount - creditCreated);
+    }
+
+    function balanceJeLines(jeLines, mainInfo) {
+        var totalDebit = 0;
+        var totalCredit = 0;
+
+        jeLines.forEach(function (line) {
+            totalDebit = round(totalDebit + money(line.debit));
+            totalCredit = round(totalCredit + money(line.credit));
+        });
+
+        if (Math.abs(totalDebit - totalCredit) <= 0.009) return;
+        if (!mainInfo.account) throw new Error('Main account missing for balancing line.');
+
+        jeLines.push({
+            account: mainInfo.account,
+            entity: mainInfo.entity,
+            department: mainInfo.department,
+            classId: mainInfo.classId,
+            location: mainInfo.location,
+            debit: totalCredit > totalDebit ? round(totalCredit - totalDebit) : 0,
+            credit: totalDebit > totalCredit ? round(totalDebit - totalCredit) : 0
+        });
+    }
+
+    function applyBillPaymentToJe(paymentId, jeId, jeAmount) {
+        var paymentRecord = record.load({
+            type: record.Type.VENDOR_PAYMENT,
+            id: paymentId,
+            isDynamic: false
+        });
+        var lineCount = paymentRecord.getLineCount({ sublistId: 'apply' });
+        var appliedJe = false;
+
+        for (var i = 0; i < lineCount; i++) {
+            paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: false });
+        }
+
+        try {
+            paymentRecord.setValue({ fieldId: UNAPPLIED_DATE_FIELD, value: new Date() });
+        } catch (e) {
+            log.debug('Bill Payment Unapplied Date Not Set', e.message);
+        }
+
+        for (var j = 0; j < lineCount; j++) {
+            var internalId = String(paymentRecord.getSublistValue({
+                sublistId: 'apply',
+                fieldId: 'internalid',
+                line: j
+            }) || '');
+            var docId = String(paymentRecord.getSublistValue({
+                sublistId: 'apply',
+                fieldId: 'doc',
+                line: j
+            }) || '');
+
+            if (internalId === String(jeId) || docId === String(jeId)) {
+                paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: j, value: true });
+
+                try {
+                    paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: j, value: jeAmount });
+                } catch (e2) {
+                    log.debug('Bill Payment JE Apply Amount Not Set', e2.message);
+                }
+
+                appliedJe = true;
+                break;
+            }
+        }
+
+        if (!appliedJe) {
+            throw new Error('Journal Entry ' + jeId + ' was not found on Bill Payment ' + paymentId + ' apply sublist.');
+        }
+
+        return paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: true });
+    }
+
+    function isDuplicateFile(fileName) {
+        return !!search.create({
+            type: 'file',
+            filters: [
+                ['name', 'is', fileName],
+                'AND',
+                ['folder', 'anyof', PROCESSED_FOLDER_ID]
+            ],
+            columns: ['internalid']
+        }).run().getRange({ start: 0, end: 1 }).length;
     }
 
     function runPaged(searchObj, callback) {
@@ -611,7 +1174,7 @@ log.debug('ACH Payment Save Attempt', {
     }
 
     function parseCsv(text) {
-        var rows = [];
+        var rawRows = [];
         var row = [];
         var cell = '';
         var quoted = false;
@@ -631,7 +1194,7 @@ log.debug('ACH Payment Save Attempt', {
             } else if ((c === '\n' || c === '\r') && !quoted) {
                 if (c === '\r' && next === '\n') i++;
                 row.push(cell);
-                if (row.join('').trim()) rows.push(row);
+                if (row.join('').trim()) rawRows.push(row);
                 row = [];
                 cell = '';
             } else {
@@ -641,24 +1204,34 @@ log.debug('ACH Payment Save Attempt', {
 
         if (cell || row.length) {
             row.push(cell);
-            if (row.join('').trim()) rows.push(row);
+            if (row.join('').trim()) rawRows.push(row);
         }
 
-        var headers = (rows.shift() || []).map(function (header) {
-            return String(header || '').replace(/^\uFEFF/, '').trim();
+        var headers = (rawRows.shift() || []).map(function (header) {
+            return clean(String(header || '').replace(/^\uFEFF/, ''));
         });
 
-        return rows.map(function (cols) {
-            var obj = {};
-            headers.forEach(function (header, index) {
-                obj[header] = cols[index] || '';
+        return rawRows.map(function (cols, index) {
+            var obj = {
+                cols: cols,
+                rowNumber: index + 2
+            };
+
+            headers.forEach(function (header, colIndex) {
+                obj[header] = cols[colIndex] || '';
             });
+
             return obj;
         });
     }
 
+    function clean(value) {
+        return String(value || '').replace(/^"|"$/g, '').trim();
+    }
+
     function money(value) {
-        return Number(String(value || '0').replace(/[$,]/g, '')) || 0;
+        var match = String(value || '').replace(/[$,]/g, '').match(/-?\d+(\.\d+)?/);
+        return match ? Math.abs(Number(match[0])) : 0;
     }
 
     function round(value) {
@@ -674,191 +1247,9 @@ log.debug('ACH Payment Save Attempt', {
         }
     }
 
-  function createAndApplyPaymentJe(paymentId, jeAmount) {
-    var paymentHeader = record.load({
-        type: record.Type.CUSTOMER_PAYMENT,
-        id: paymentId,
-        isDynamic: false
-    });
-
-    var customerId = paymentHeader.getValue({ fieldId: 'customer' });
-    var subsidiaryId = paymentHeader.getValue({ fieldId: 'subsidiary' });
-    var currencyId = paymentHeader.getValue({ fieldId: 'currency' });
-    var memoText = 'ACH Return Payment Offset';
-    var mainInfo = {};
-    var jeLineMap = {};
-    var jeLines = [];
-    var sourceDebitTotal = 0;
-    var sourceCreditTotal = 0;
-
-    runPaged(search.create({
-        type: 'customerpayment',
-        settings: [{ name: 'consolidationtype', value: 'ACCTTYPE' }],
-        filters: [
-            ['type', 'anyof', 'CustPymt'],
-            'AND',
-            ['internalid', 'anyof', paymentId]
-        ],
-        columns: [
-            search.createColumn({ name: 'accountmain' }),
-            search.createColumn({ name: 'account' }),
-            search.createColumn({ name: 'entity' }),
-            search.createColumn({ name: 'department' }),
-            search.createColumn({ name: 'class' }),
-            search.createColumn({ name: 'location' }),
-            search.createColumn({ name: 'memo' }),
-            search.createColumn({ name: 'debitamount' }),
-            search.createColumn({ name: 'creditamount' })
-        ]
-    }), function (result) {
-        var mainAccount = result.getValue({ name: 'accountmain' });
-        var lineAccount = result.getValue({ name: 'account' });
-        var debitAmount = money(result.getValue({ name: 'debitamount' }));
-        var creditAmount = money(result.getValue({ name: 'creditamount' }));
-        var entityId = result.getValue({ name: 'entity' }) || customerId;
-        var departmentId = result.getValue({ name: 'department' });
-        var classId = result.getValue({ name: 'class' });
-        var locationId = result.getValue({ name: 'location' });
-
-        if (String(mainAccount) === String(lineAccount)) {
-            mainInfo = {
-                account: mainAccount,
-                entity: entityId,
-                department: departmentId,
-                classId: classId,
-                location: locationId,
-                memo: result.getValue({ name: 'memo' })
-            };
-            return;
-        }
-
-        if (!lineAccount || (!debitAmount && !creditAmount)) return;
-
-        var key = [
-            lineAccount,
-            entityId,
-            departmentId || '',
-            classId || '',
-            locationId || '',
-            debitAmount > 0 ? 'C' : 'D'
-        ].join('|');
-
-        if (!jeLineMap[key]) {
-            jeLineMap[key] = {
-                account: lineAccount,
-                entity: entityId,
-                department: departmentId,
-                classId: classId,
-                location: locationId,
-                sourceDebit: 0,
-                sourceCredit: 0,
-                debit: 0,
-                credit: 0
-            };
-            jeLines.push(jeLineMap[key]);
-        }
-
-        jeLineMap[key].sourceDebit = round(jeLineMap[key].sourceDebit + debitAmount);
-        jeLineMap[key].sourceCredit = round(jeLineMap[key].sourceCredit + creditAmount);
-        sourceDebitTotal = round(sourceDebitTotal + debitAmount);
-        sourceCreditTotal = round(sourceCreditTotal + creditAmount);
-    });
-
-    var debitCreated = 0;
-    var creditCreated = 0;
-    var lastDebitLine = null;
-    var lastCreditLine = null;
-
-    jeLines.forEach(function (line) {
-        if (line.sourceCredit > 0 && sourceCreditTotal > 0) {
-            line.debit = round(line.sourceCredit / sourceCreditTotal * jeAmount);
-            debitCreated = round(debitCreated + line.debit);
-            lastDebitLine = line;
-        }
-
-        if (line.sourceDebit > 0 && sourceDebitTotal > 0) {
-            line.credit = round(line.sourceDebit / sourceDebitTotal * jeAmount);
-            creditCreated = round(creditCreated + line.credit);
-            lastCreditLine = line;
-        }
-    });
-
-    if (lastDebitLine) lastDebitLine.debit = round(lastDebitLine.debit + jeAmount - debitCreated);
-    if (lastCreditLine) lastCreditLine.credit = round(lastCreditLine.credit + jeAmount - creditCreated);
-
-    log.debug('ACH Return JE Lines', {
-        paymentId: paymentId,
-        jeAmount: jeAmount,
-        mainInfo: mainInfo,
-        sourceDebitTotal: sourceDebitTotal,
-        sourceCreditTotal: sourceCreditTotal,
-        lines: jeLines
-    });
-
-    var jeRecord = record.create({
-        type: record.Type.JOURNAL_ENTRY,
-        isDynamic: true
-    });
-
-    jeRecord.setValue({ fieldId: 'subsidiary', value: subsidiaryId });
-    if (currencyId) jeRecord.setValue({ fieldId: 'currency', value: currencyId });
-    jeRecord.setValue({ fieldId: 'approvalstatus', value: 2 });
-    jeRecord.setValue({ fieldId: 'memo', value: memoText });
-
-    jeLines.forEach(function (line) {
-        if (!line.account || (!line.debit && !line.credit)) return;
-
-        jeRecord.selectNewLine({ sublistId: 'line' });
-        jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'linesubsidiary', value: subsidiaryId });
-        jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'account', value: line.account });
-        jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'entity', value: line.entity || mainInfo.entity || customerId });
-        jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'memo', value: memoText });
-        if (line.department || mainInfo.department) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'department', value: line.department || mainInfo.department });
-        if (line.classId || mainInfo.classId) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'class', value: line.classId || mainInfo.classId });
-        if (line.location || mainInfo.location) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'location', value: line.location || mainInfo.location });
-        if (line.debit) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'debit', value: line.debit });
-        if (line.credit) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'credit', value: line.credit });
-        jeRecord.commitLine({ sublistId: 'line' });
-    });
-
-    var jeId = jeRecord.save();
-
-    var applyPayment = record.load({
-        type: record.Type.CUSTOMER_PAYMENT,
-        id: paymentId,
-        isDynamic: false
-    });
-
-    var applyCount = applyPayment.getLineCount({ sublistId: 'apply' });
-    var appliedJe = false;
-
-    for (var i = 0; i < applyCount; i++) {
-        var applyInternalId = String(applyPayment.getSublistValue({ sublistId: 'apply', fieldId: 'internalid', line: i }) || '');
-        var applyDocId = String(applyPayment.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: i }) || '');
-
-        if (applyInternalId === String(jeId) || applyDocId === String(jeId)) {
-            applyPayment.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: true });
-            applyPayment.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i, value: jeAmount });
-            appliedJe = true;
-            break;
-        }
-    }
-
-    if (appliedJe) {
-        applyPayment.save({ enableSourcing: false, ignoreMandatoryFields: true });
-    } else {
-        log.error('ACH Return JE Not Found On Payment Apply', {
-            paymentId: paymentId,
-            journalId: jeId,
-            jeAmount: jeAmount
-        });
-    }
-
-    return jeId;
-}
-
     return {
         getInputData: getInputData,
-        map: map
+        map: map,
+        summarize: summarize
     };
 });

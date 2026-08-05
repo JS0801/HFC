@@ -12,6 +12,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
     var OPERATING_SEQ_FIELD = 'custitem_operating_seq';
     var NAF_SEQ_FIELD = 'custitem_naf_seq';
     var VOID_MEMO_TEXT = 'ACH RETURN VOIDED';
+    var CUSTOMER_JE_MEMO_TEXT = 'ACH Return Payment Offset';
     var AP_MEMO_TEXT = 'NSF Bill Payment Reversal';
     var UNAPPLIED_DATE_FIELD = 'custbody_datetimeunapplied';
     var PROCESS_CUSTOMER = 'CUSTOMER_PAYMENT';
@@ -790,25 +791,20 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                 });
             }
 
-            var bodyPaymentAfter = round(keptGroupAmount + outsideAmount);
+            var targetAppliedAmount = round(keptGroupAmount + outsideAmount);
+            var jeAmount = hadGroupApply ? round(bodyPaymentBefore - targetAppliedAmount) : 0;
+            var returnJeId = '';
 
-            if (hadGroupApply && bodyPaymentAfter > 0 && Math.abs(bodyPaymentBefore - bodyPaymentAfter) > 0.009) {
-                paymentRecord.setValue({ fieldId: 'payment', value: bodyPaymentAfter });
+            if (hadGroupApply && jeAmount > 0.009) {
                 changed = true;
-                log.debug('Customer Payment Body Amount Set', {
+                log.debug('Customer Payment JE Needed', {
                     paymentId: payment.paymentId,
                     paymentRef: payment.paymentRef,
                     bodyPaymentBefore: bodyPaymentBefore,
-                    bodyPaymentAfter: bodyPaymentAfter,
+                    targetAppliedAmount: targetAppliedAmount,
                     keptGroupAmount: keptGroupAmount,
-                    outsideAmount: outsideAmount
-                });
-            } else if (hadGroupApply && bodyPaymentAfter <= 0 && Math.abs(bodyPaymentBefore) > 0.009) {
-                log.debug('Customer Payment Body Amount Not Set To Zero', {
-                    paymentId: payment.paymentId,
-                    paymentRef: payment.paymentRef,
-                    bodyPaymentBefore: bodyPaymentBefore,
-                    bodyPaymentAfter: bodyPaymentAfter
+                    outsideAmount: outsideAmount,
+                    jeAmount: jeAmount
                 });
             }
 
@@ -829,7 +825,8 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                     paymentId: payment.paymentId,
                     paymentRef: payment.paymentRef,
                     bodyPaymentBefore: bodyPaymentBefore,
-                    bodyPaymentAfter: bodyPaymentAfter,
+                    targetAppliedAmount: targetAppliedAmount,
+                    jeAmount: jeAmount,
                     appliedBefore: appliedBefore,
                     keptGroupAmount: keptGroupAmount,
                     outsideAmount: outsideAmount,
@@ -838,6 +835,18 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                 });
 
                 var savedId = paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: true });
+
+                if (jeAmount > 0.009) {
+                    returnJeId = createCustomerPaymentJeAndApply(savedId, jeAmount, payment.paymentRef);
+
+                    log.audit('Customer Payment JE Applied', {
+                        paymentId: savedId,
+                        paymentRef: payment.paymentRef,
+                        journalId: returnJeId,
+                        jeAmount: jeAmount
+                    });
+                }
+
                 var savedRecord = record.load({
                     type: record.Type.CUSTOMER_PAYMENT,
                     id: savedId,
@@ -861,9 +870,10 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                     paymentRef: payment.paymentRef,
                     keptAmount: keptGroupAmount,
                     bodyPaymentBefore: bodyPaymentBefore,
-                    expectedBodyPayment: bodyPaymentAfter,
+                    targetAppliedAmount: targetAppliedAmount,
                     savedBodyPayment: money(savedRecord.getValue({ fieldId: 'payment' })),
                     savedAppliedAmount: savedApplied,
+                    returnJeId: returnJeId,
                     memoVoided: hadGroupApply && keptGroupAmount <= 0 && !hasOutsideApply
                 });
             } else {
@@ -894,6 +904,158 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             desiredLeftCount: desiredLeft.length,
             desiredLeft: desiredLeft.slice(0, 25)
         });
+    }
+
+    function createCustomerPaymentJeAndApply(paymentId, jeAmount, paymentRef) {
+        var paymentHeader = record.load({
+            type: record.Type.CUSTOMER_PAYMENT,
+            id: paymentId,
+            isDynamic: false
+        });
+        var customerId = paymentHeader.getValue({ fieldId: 'customer' }) || paymentHeader.getValue({ fieldId: 'entity' });
+        var subsidiaryId = paymentHeader.getValue({ fieldId: 'subsidiary' });
+        var currencyId = paymentHeader.getValue({ fieldId: 'currency' });
+        var mainInfo = {};
+        var lineMap = {};
+        var jeLines = [];
+        var sourceDebitTotal = 0;
+        var sourceCreditTotal = 0;
+        var memoText = CUSTOMER_JE_MEMO_TEXT + ' - ' + paymentRef;
+
+        runPaged(search.create({
+            type: 'customerpayment',
+            settings: [{ name: 'consolidationtype', value: 'ACCTTYPE' }],
+            filters: [
+                ['type', 'anyof', 'CustPymt'],
+                'AND',
+                ['internalid', 'anyof', paymentId]
+            ],
+            columns: [
+                'accountmain',
+                'account',
+                'entity',
+                'department',
+                'class',
+                'location',
+                'memo',
+                'debitamount',
+                'creditamount'
+            ]
+        }), function (result) {
+            var mainAccount = result.getValue({ name: 'accountmain' });
+            var lineAccount = result.getValue({ name: 'account' });
+            var debitAmount = money(result.getValue({ name: 'debitamount' }));
+            var creditAmount = money(result.getValue({ name: 'creditamount' }));
+            var entityId = result.getValue({ name: 'entity' }) || customerId;
+            var departmentId = result.getValue({ name: 'department' });
+            var classId = result.getValue({ name: 'class' });
+            var locationId = result.getValue({ name: 'location' });
+
+            if (!lineAccount || (!debitAmount && !creditAmount)) return;
+
+            if (String(mainAccount) === String(lineAccount)) {
+                mainInfo = {
+                    account: mainAccount,
+                    entity: entityId,
+                    department: departmentId,
+                    classId: classId,
+                    location: locationId
+                };
+                return;
+            }
+
+            var side = debitAmount > 0 ? 'C' : 'D';
+            var key = [lineAccount, entityId, departmentId || '', classId || '', locationId || '', side].join('|');
+
+            if (!lineMap[key]) {
+                lineMap[key] = {
+                    account: lineAccount,
+                    entity: entityId,
+                    department: departmentId,
+                    classId: classId,
+                    location: locationId,
+                    sourceDebit: 0,
+                    sourceCredit: 0,
+                    debit: 0,
+                    credit: 0
+                };
+                jeLines.push(lineMap[key]);
+            }
+
+            lineMap[key].sourceDebit = round(lineMap[key].sourceDebit + debitAmount);
+            lineMap[key].sourceCredit = round(lineMap[key].sourceCredit + creditAmount);
+            sourceDebitTotal = round(sourceDebitTotal + debitAmount);
+            sourceCreditTotal = round(sourceCreditTotal + creditAmount);
+        });
+
+        if (!jeLines.length) throw new Error('No non-main GL lines found for Customer Payment ' + paymentId);
+
+        scaleJeLines(jeLines, sourceDebitTotal, sourceCreditTotal, jeAmount);
+        balanceJeLines(jeLines, mainInfo);
+
+        log.debug('Customer Payment JE Lines Prepared', {
+            paymentId: paymentId,
+            paymentRef: paymentRef,
+            jeAmount: jeAmount,
+            mainInfo: mainInfo,
+            sourceDebitTotal: sourceDebitTotal,
+            sourceCreditTotal: sourceCreditTotal,
+            lines: jeLines
+        });
+
+        var jeRecord = record.create({
+            type: record.Type.JOURNAL_ENTRY,
+            isDynamic: true
+        });
+
+        jeRecord.setValue({ fieldId: 'subsidiary', value: subsidiaryId });
+        if (currencyId) jeRecord.setValue({ fieldId: 'currency', value: currencyId });
+        jeRecord.setValue({ fieldId: 'approvalstatus', value: 2 });
+        jeRecord.setValue({ fieldId: 'memo', value: memoText });
+
+        jeLines.forEach(function (line) {
+            if (!line.account || (!line.debit && !line.credit)) return;
+
+            jeRecord.selectNewLine({ sublistId: 'line' });
+            jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'linesubsidiary', value: subsidiaryId });
+            jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'account', value: line.account });
+            jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'entity', value: line.entity || mainInfo.entity || customerId });
+            jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'memo', value: memoText });
+            if (line.department || mainInfo.department) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'department', value: line.department || mainInfo.department });
+            if (line.classId || mainInfo.classId) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'class', value: line.classId || mainInfo.classId });
+            if (line.location || mainInfo.location) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'location', value: line.location || mainInfo.location });
+            if (line.debit) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'debit', value: line.debit });
+            if (line.credit) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'credit', value: line.credit });
+            jeRecord.commitLine({ sublistId: 'line' });
+        });
+
+        var jeId = jeRecord.save();
+        var applyPayment = record.load({
+            type: record.Type.CUSTOMER_PAYMENT,
+            id: paymentId,
+            isDynamic: false
+        });
+        var applyCount = applyPayment.getLineCount({ sublistId: 'apply' });
+        var appliedJe = false;
+
+        for (var i = 0; i < applyCount; i++) {
+            var applyInternalId = String(applyPayment.getSublistValue({ sublistId: 'apply', fieldId: 'internalid', line: i }) || '');
+            var applyDocId = String(applyPayment.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: i }) || '');
+
+            if (applyInternalId === String(jeId) || applyDocId === String(jeId)) {
+                applyPayment.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: true });
+                applyPayment.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i, value: jeAmount });
+                appliedJe = true;
+                break;
+            }
+        }
+
+        if (!appliedJe) {
+            throw new Error('Journal Entry ' + jeId + ' was not found on Customer Payment ' + paymentId + ' apply sublist.');
+        }
+
+        applyPayment.save({ enableSourcing: false, ignoreMandatoryFields: true });
+        return jeId;
     }
 
     function createBillPaymentJeAndApply(paymentId, returnedAmount, paymentRef) {

@@ -55,7 +55,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
 
         var tranLookup = findReturnedTransactions(failedLookup);
         var customerFailedLookup = {};
-        var billPaymentArray = [];
+        var billFailedLookup = {};
         var inputErrors = [];
 
         failedRefs.forEach(function (ref) {
@@ -86,17 +86,10 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                 failed.csvPaymentRef = ref;
                 customerFailedLookup[failed.paymentRef] = failed;
             } else if (tran.processType === PROCESS_BILL) {
-                billPaymentArray.push({
-                    processType: PROCESS_BILL,
-                    fileId: String(fileObj.id),
-                    fileName: fileObj.name,
-                    paymentId: tran.paymentId,
-                    paymentRef: tran.tranId || ref,
-                    csvPaymentRef: ref,
-                    returnedAmount: failed.returnedAmount,
-                    returnCode: failed.returnCode,
-                    returnReason: failed.returnReason
-                });
+                failed.paymentId = tran.paymentId;
+                failed.paymentRef = tran.tranId || ref;
+                failed.csvPaymentRef = ref;
+                billFailedLookup[failed.paymentRef] = failed;
             }
         });
 
@@ -105,6 +98,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         }
 
         var customerPaymentArray = buildCustomerPaymentGroups(customerFailedLookup, fileObj.id, fileObj.name);
+        var billPaymentArray = buildBillPaymentGroups(billFailedLookup, fileObj.id, fileObj.name);
         var output = customerPaymentArray.concat(billPaymentArray);
 
         log.audit('ACH Return Input Prepared', {
@@ -128,17 +122,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         }
 
         if (data.processType === PROCESS_BILL) {
-            var result = createBillPaymentJeAndApply(data.paymentId, data.returnedAmount, data.paymentRef);
-
-            log.audit('Bill Payment Return Processed', {
-                paymentId: data.paymentId,
-                paymentRef: data.paymentRef,
-                csvPaymentRef: data.csvPaymentRef,
-                returnedAmount: data.returnedAmount,
-                journalId: result.journalId,
-                savedPaymentId: result.paymentId
-            });
-
+            processBillPaymentGroup(data);
             context.write({ key: 'fileId', value: data.fileId });
             return;
         }
@@ -560,6 +544,239 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         });
 
         return output;
+    }
+
+    function buildBillPaymentGroups(billFailedLookup, fileId, fileName) {
+        var failedRefs = Object.keys(billFailedLookup);
+        var groups = {};
+        var foundFailedRefs = {};
+
+        if (!failedRefs.length) return [];
+
+        runPaged(search.create({
+            type: 'vendorpayment',
+            settings: [{ name: 'consolidationtype', value: 'ACCTTYPE' }],
+            filters: [
+                ['type', 'anyof', 'VendPymt'],
+                'AND',
+                [BATCH_FIELD, 'noneof', '@NONE@'],
+                'AND',
+                ['trandate', 'within', 'daysago' + DAYS_BACK, 'daysago0'],
+                'AND',
+                ['appliedtotransaction.type', 'anyof', 'VendBill']
+            ],
+            columns: [
+                'internalid',
+                'tranid',
+                'trandate',
+                BATCH_FIELD,
+                'entity',
+                'accountmain',
+                'account',
+                'amount',
+                'appliedtotransaction',
+                'appliedtolinkamount'
+            ]
+        }), function (result) {
+            var paymentId = String(result.getValue({ name: 'internalid' }));
+            var ref = clean(result.getValue({ name: 'tranid' }));
+            var batchId = result.getValue({ name: BATCH_FIELD });
+            var vendorId = result.getValue({ name: 'entity' });
+            var accountId = result.getValue({ name: 'accountmain' }) || result.getValue({ name: 'account' });
+            var accountName = String(result.getText({ name: 'accountmain' }) || result.getText({ name: 'account' }) || '');
+            var paymentAmount = Math.abs(money(result.getValue({ name: 'amount' })));
+            var billId = result.getValue({ name: 'appliedtotransaction' });
+            var appliedAmount = Math.abs(money(result.getValue({ name: 'appliedtolinkamount' })));
+            var failed = billFailedLookup[ref];
+            var key = [batchId, vendorId, accountId].join('_');
+
+            if (!paymentId || !batchId || !vendorId || !accountId || !paymentAmount || !billId || !appliedAmount) return;
+
+            if (!groups[key]) {
+                groups[key] = {
+                    processType: PROCESS_BILL,
+                    fileId: String(fileId),
+                    fileName: fileName,
+                    key: key,
+                    batchId: String(batchId),
+                    vendorId: String(vendorId),
+                    accountId: String(accountId),
+                    accountName: accountName,
+                    passedPayments: [],
+                    failedPayments: [],
+                    totals: {
+                        batchAmount: 0,
+                        failedAmount: 0,
+                        availableAmount: 0
+                    },
+                    billAmounts: {},
+                    paymentMap: {}
+                };
+            }
+
+            var payment = groups[key].paymentMap[paymentId];
+
+            if (!payment) {
+                payment = {
+                    paymentId: paymentId,
+                    paymentRef: ref,
+                    paymentDate: result.getValue({ name: 'trandate' }),
+                    amount: paymentAmount,
+                    appliedBills: []
+                };
+
+                groups[key].paymentMap[paymentId] = payment;
+                groups[key].totals.batchAmount = round(groups[key].totals.batchAmount + paymentAmount);
+
+                if (failed) {
+                    foundFailedRefs[failed.csvPaymentRef || ref] = true;
+                    payment.returnedAmount = failed.returnedAmount;
+                    payment.returnCode = failed.returnCode;
+                    payment.returnReason = failed.returnReason;
+                    groups[key].failedPayments.push(payment);
+
+                    log.debug('Bill Failed Payment Matched', {
+                        key: key,
+                        paymentId: paymentId,
+                        paymentRef: ref,
+                        returnedAmount: failed.returnedAmount,
+                        batchId: batchId,
+                        vendorId: vendorId,
+                        accountId: accountId
+                    });
+                } else {
+                    groups[key].passedPayments.push(payment);
+                }
+            }
+
+            billId = String(billId);
+            payment.appliedBills.push({
+                billId: billId,
+                appliedAmount: appliedAmount
+            });
+            groups[key].billAmounts[billId] = round((groups[key].billAmounts[billId] || 0) + appliedAmount);
+        });
+
+        var output = Object.keys(groups).reduce(function (list, key) {
+            var group = groups[key];
+
+            if (!group.failedPayments.length) return list;
+
+            group.totals.failedAmount = group.failedPayments.reduce(function (total, payment) {
+                return round(total + money(payment.returnedAmount));
+            }, 0);
+            group.totals.availableAmount = Math.max(0, round(group.totals.batchAmount - group.totals.failedAmount));
+
+            prepareBillAllocation(group);
+            delete group.paymentMap;
+            list.push(group);
+            return list;
+        }, []);
+
+        var unmatchedRefs = failedRefs.filter(function (ref) {
+            return !foundFailedRefs[billFailedLookup[ref].csvPaymentRef || ref];
+        });
+
+        if (unmatchedRefs.length) {
+            throw new Error('Bill payments were found but not available in batch/apply search: ' + unmatchedRefs.slice(0, 25).join(', '));
+        }
+
+        log.audit('Bill Return Groups Built', {
+            groups: output.length,
+            unmatchedFailedRefs: unmatchedRefs
+        });
+
+        return output;
+    }
+
+    function prepareBillAllocation(group) {
+        var billAmounts = group.billAmounts || {};
+        var billIds = Object.keys(billAmounts);
+        var billInfo = {};
+
+        if (billIds.length) {
+            runPaged(search.create({
+                type: search.Type.VENDOR_BILL,
+                filters: [
+                    ['internalid', 'anyof', billIds],
+                    'AND',
+                    ['mainline', 'is', 'T']
+                ],
+                columns: [
+                    'internalid',
+                    'tranid',
+                    'trandate'
+                ]
+            }), function (result) {
+                var billId = String(result.getValue({ name: 'internalid' }));
+
+                billInfo[billId] = {
+                    billId: billId,
+                    billNumber: result.getValue({ name: 'tranid' }),
+                    billDate: result.getValue({ name: 'trandate' }),
+                    billDateTime: dateTime(result.getValue({ name: 'trandate' }))
+                };
+            });
+        }
+
+        billIds.forEach(function (billId) {
+            if (!billInfo[billId]) {
+                billInfo[billId] = {
+                    billId: billId,
+                    billNumber: '',
+                    billDate: '',
+                    billDateTime: 9999999999999
+                };
+            }
+        });
+
+        billIds.sort(function (a, b) {
+            return billInfo[a].billDateTime - billInfo[b].billDateTime ||
+                Number(a) - Number(b);
+        });
+
+        var remaining = group.totals.availableAmount;
+        var desiredByBill = {};
+        var allocation = { full: 0, partial: 0, unpaid: 0 };
+        var details = [];
+
+        billIds.forEach(function (billId) {
+            var currentAmount = billAmounts[billId];
+            var desiredAmount = round(Math.min(currentAmount, remaining));
+
+            desiredByBill[billId] = desiredAmount;
+            remaining = round(remaining - desiredAmount);
+
+            if (desiredAmount >= currentAmount - 0.009) allocation.full++;
+            else if (desiredAmount > 0) allocation.partial++;
+            else allocation.unpaid++;
+
+            details.push({
+                billId: billId,
+                billNumber: billInfo[billId].billNumber,
+                billDate: billInfo[billId].billDate,
+                currentAmount: currentAmount,
+                desiredAmount: desiredAmount
+            });
+        });
+
+        group.desiredByBill = desiredByBill;
+        group.allocation = allocation;
+        group.billAllocationDetails = details;
+
+        log.audit('Bill Allocation Prepared', {
+            key: group.key,
+            bills: billIds.length,
+            full: allocation.full,
+            partial: allocation.partial,
+            unpaid: allocation.unpaid,
+            unusedAmount: remaining
+        });
+        log.debug('Bill Allocation Detail', {
+            key: group.key,
+            detailsShown: Math.min(details.length, 25),
+            details: details.slice(0, 25)
+        });
     }
 
     function prepareCustomerAllocation(group) {
@@ -1058,7 +1275,213 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         return jeId;
     }
 
-    function createBillPaymentJeAndApply(paymentId, returnedAmount, paymentRef) {
+    function processBillPaymentGroup(group) {
+        var desiredByBill = {};
+        var payments = group.passedPayments.concat(group.failedPayments).sort(function (a, b) {
+            return dateTime(a.paymentDate) - dateTime(b.paymentDate) ||
+                String(a.paymentRef).localeCompare(String(b.paymentRef)) ||
+                Number(a.paymentId) - Number(b.paymentId);
+        });
+
+        Object.keys(group.desiredByBill || {}).forEach(function (billId) {
+            desiredByBill[billId] = group.desiredByBill[billId];
+        });
+
+        log.audit('Bill Group Start', {
+            key: group.key,
+            batchId: group.batchId,
+            vendorId: group.vendorId,
+            accountId: group.accountId,
+            accountName: group.accountName,
+            payments: payments.length,
+            failedPayments: group.failedPayments.length,
+            availableAmount: group.totals.availableAmount,
+            allocation: group.allocation
+        });
+
+        payments.forEach(function (payment) {
+            var paymentRecord = record.load({
+                type: record.Type.VENDOR_PAYMENT,
+                id: payment.paymentId,
+                isDynamic: false
+            });
+            var lineCount = paymentRecord.getLineCount({ sublistId: 'apply' });
+            var bodyPaymentBefore = money(paymentRecord.getValue({ fieldId: 'total' }));
+            var changed = false;
+            var hadGroupApply = false;
+            var keptGroupAmount = 0;
+            var outsideAmount = 0;
+            var appliedBefore = 0;
+            var hasOutsideApply = false;
+
+            log.debug('Bill Payment Edit Start', {
+                paymentId: payment.paymentId,
+                paymentRef: payment.paymentRef,
+                bodyPaymentBefore: bodyPaymentBefore,
+                lineCount: lineCount
+            });
+
+            for (var beforeLine = 0; beforeLine < lineCount; beforeLine++) {
+                if (paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'apply', line: beforeLine })) {
+                    appliedBefore = round(appliedBefore + money(paymentRecord.getSublistValue({
+                        sublistId: 'apply',
+                        fieldId: 'amount',
+                        line: beforeLine
+                    })));
+                }
+            }
+
+            for (var i = 0; i < lineCount; i++) {
+                var applied = paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i });
+                var billId = paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: i });
+                var currentAmount = money(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i }));
+
+                if (!applied || !billId || currentAmount <= 0) continue;
+
+                billId = String(billId);
+
+                if ((group.billAmounts || {})[billId] === undefined) {
+                    hasOutsideApply = true;
+                    outsideAmount = round(outsideAmount + currentAmount);
+                    log.debug('Bill Apply Line Outside Group', {
+                        paymentId: payment.paymentId,
+                        paymentRef: payment.paymentRef,
+                        line: i,
+                        billId: billId,
+                        currentAmount: currentAmount
+                    });
+                    continue;
+                }
+
+                hadGroupApply = true;
+
+                var desiredBefore = desiredByBill[billId] || 0;
+                var allowedAmount = round(Math.min(currentAmount, desiredBefore));
+                var lineChanged = false;
+
+                desiredByBill[billId] = round((desiredByBill[billId] || 0) - allowedAmount);
+                keptGroupAmount = round(keptGroupAmount + allowedAmount);
+
+                if (allowedAmount > 0 && Math.abs(currentAmount - allowedAmount) > 0.009) {
+                    paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: true });
+                    paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i, value: allowedAmount });
+                    changed = true;
+                    lineChanged = true;
+                } else if (allowedAmount <= 0) {
+                    paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: false });
+                    changed = true;
+                    lineChanged = true;
+                }
+
+                log.debug('Bill Apply Line Decision', {
+                    paymentId: payment.paymentId,
+                    paymentRef: payment.paymentRef,
+                    line: i,
+                    billId: billId,
+                    currentAmount: currentAmount,
+                    desiredBefore: desiredBefore,
+                    allowedAmount: allowedAmount,
+                    desiredAfter: desiredByBill[billId],
+                    lineChanged: lineChanged
+                });
+            }
+
+            var targetAppliedAmount = round(keptGroupAmount + outsideAmount);
+            var jeAmount = hadGroupApply ? round(bodyPaymentBefore - targetAppliedAmount) : 0;
+            var returnJeId = '';
+
+            if (hadGroupApply && jeAmount > 0.009) {
+                changed = true;
+                log.debug('Bill Payment JE Needed', {
+                    paymentId: payment.paymentId,
+                    paymentRef: payment.paymentRef,
+                    bodyPaymentBefore: bodyPaymentBefore,
+                    targetAppliedAmount: targetAppliedAmount,
+                    keptGroupAmount: keptGroupAmount,
+                    outsideAmount: outsideAmount,
+                    jeAmount: jeAmount
+                });
+            }
+
+            if (hadGroupApply && keptGroupAmount <= 0 && !hasOutsideApply) {
+                var memo = String(paymentRecord.getValue({ fieldId: 'memo' }) || '');
+
+                if (memo.indexOf(VOID_MEMO_TEXT) === -1) {
+                    paymentRecord.setValue({
+                        fieldId: 'memo',
+                        value: memo ? memo + ' | ' + VOID_MEMO_TEXT : VOID_MEMO_TEXT
+                    });
+                    changed = true;
+                }
+            }
+
+            if (changed) {
+                log.debug('Bill Payment Save Attempt', {
+                    paymentId: payment.paymentId,
+                    paymentRef: payment.paymentRef,
+                    bodyPaymentBefore: bodyPaymentBefore,
+                    targetAppliedAmount: targetAppliedAmount,
+                    jeAmount: jeAmount,
+                    appliedBefore: appliedBefore,
+                    keptGroupAmount: keptGroupAmount,
+                    outsideAmount: outsideAmount,
+                    hadGroupApply: hadGroupApply,
+                    hasOutsideApply: hasOutsideApply
+                });
+
+                var savedId = paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: true });
+
+                if (jeAmount > 0.009) {
+                    returnJeId = createBillPaymentJeAndApply(savedId, jeAmount, payment.paymentRef);
+
+                    log.audit('Bill Payment JE Applied', {
+                        paymentId: savedId,
+                        paymentRef: payment.paymentRef,
+                        journalId: returnJeId,
+                        jeAmount: jeAmount
+                    });
+                }
+
+                log.audit('Bill Payment Updated', {
+                    paymentId: payment.paymentId,
+                    paymentRef: payment.paymentRef,
+                    keptAmount: keptGroupAmount,
+                    bodyPaymentBefore: bodyPaymentBefore,
+                    targetAppliedAmount: targetAppliedAmount,
+                    returnJeId: returnJeId,
+                    memoVoided: hadGroupApply && keptGroupAmount <= 0 && !hasOutsideApply
+                });
+            } else {
+                log.debug('Bill Payment No Change', {
+                    paymentId: payment.paymentId,
+                    paymentRef: payment.paymentRef,
+                    bodyPaymentBefore: bodyPaymentBefore,
+                    appliedBefore: appliedBefore,
+                    keptGroupAmount: keptGroupAmount,
+                    outsideAmount: outsideAmount,
+                    hadGroupApply: hadGroupApply,
+                    hasOutsideApply: hasOutsideApply
+                });
+            }
+        });
+
+        var desiredLeft = Object.keys(desiredByBill).filter(function (billId) {
+            return Math.abs(desiredByBill[billId]) > 0.009;
+        }).map(function (billId) {
+            return {
+                billId: billId,
+                amountLeft: desiredByBill[billId]
+            };
+        });
+
+        log.audit('Bill Group Complete', {
+            key: group.key,
+            desiredLeftCount: desiredLeft.length,
+            desiredLeft: desiredLeft.slice(0, 25)
+        });
+    }
+
+    function createBillPaymentJeAndApply(paymentId, jeAmount, paymentRef) {
         var paymentRecord = record.load({
             type: record.Type.VENDOR_PAYMENT,
             id: paymentId,
@@ -1069,7 +1492,8 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         var currencyId = paymentRecord.getValue({ fieldId: 'currency' });
         var mainAccountId = paymentRecord.getValue({ fieldId: 'account' });
         var paymentTotal = round(money(paymentRecord.getValue({ fieldId: 'total' })));
-        var jeAmount = round(returnedAmount || paymentTotal);
+
+        jeAmount = round(jeAmount);
 
         if (jeAmount <= 0) throw new Error('JE amount is zero for Bill Payment ' + paymentId);
 
@@ -1110,16 +1534,13 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             paymentId: paymentId,
             paymentRef: paymentRef,
             paymentTotal: paymentTotal,
-            returnedAmount: returnedAmount,
             jeAmount: jeAmount,
             journalId: jeId,
+            savedPaymentId: savedPaymentId,
             lines: jeLines
         });
 
-        return {
-            journalId: jeId,
-            paymentId: savedPaymentId
-        };
+        return jeId;
     }
 
     function getBillPaymentJeLines(paymentId, mainAccountId, entityId, jeAmount) {
@@ -1271,10 +1692,6 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         });
         var lineCount = paymentRecord.getLineCount({ sublistId: 'apply' });
         var appliedJe = false;
-
-        for (var i = 0; i < lineCount; i++) {
-            paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: false });
-        }
 
         try {
             paymentRecord.setValue({ fieldId: UNAPPLIED_DATE_FIELD, value: new Date() });

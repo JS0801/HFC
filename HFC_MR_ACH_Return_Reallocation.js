@@ -1313,6 +1313,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             var outsideAmount = 0;
             var appliedBefore = 0;
             var hasOutsideApply = false;
+            var lineActions = [];
 
             log.debug('Bill Payment Edit Start', {
                 paymentId: payment.paymentId,
@@ -1365,10 +1366,12 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                 if (allowedAmount > 0 && Math.abs(currentAmount - allowedAmount) > 0.009) {
                     paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: true });
                     paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i, value: allowedAmount });
+                    lineActions.push({ line: i, billId: billId, apply: true, amount: allowedAmount });
                     changed = true;
                     lineChanged = true;
                 } else if (allowedAmount <= 0) {
                     paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: false });
+                    lineActions.push({ line: i, billId: billId, apply: false, amount: 0 });
                     changed = true;
                     lineChanged = true;
                 }
@@ -1429,17 +1432,45 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                     hasOutsideApply: hasOutsideApply
                 });
 
-                var savedId = paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: true });
+                var savedId;
 
                 if (jeAmount > 0.009) {
-                    returnJeId = createBillPaymentJeAndApply(savedId, jeAmount, payment.paymentRef);
+                    returnJeId = createBillPaymentJe(payment.paymentId, jeAmount, payment.paymentRef);
+                    paymentRecord = record.load({
+                        type: record.Type.VENDOR_PAYMENT,
+                        id: payment.paymentId,
+                        isDynamic: false
+                    });
+
+                    applyBillPaymentLineActions(paymentRecord, lineActions);
+
+                    var freshMemo = String(paymentRecord.getValue({ fieldId: 'memo' }) || '');
+
+                    if (freshMemo.indexOf(VOID_MEMO_TEXT) === -1) {
+                        paymentRecord.setValue({
+                            fieldId: 'memo',
+                            value: freshMemo ? freshMemo + ' | ' + VOID_MEMO_TEXT : VOID_MEMO_TEXT
+                        });
+                    }
+
+                    try {
+                        paymentRecord.setValue({ fieldId: UNAPPLIED_DATE_FIELD, value: new Date() });
+                    } catch (e) {
+                        log.debug('Bill Payment Unapplied Date Not Set', e.message);
+                    }
+
+                    applyBillPaymentJeLine(paymentRecord, returnJeId, jeAmount);
+                    savedId = paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: true });
 
                     log.audit('Bill Payment JE Applied', {
                         paymentId: savedId,
                         paymentRef: payment.paymentRef,
                         journalId: returnJeId,
-                        jeAmount: jeAmount
+                        jeAmount: jeAmount,
+                        saveMode: 'JE_BEFORE_PAYMENT_SAVE'
                     });
+                } else {
+                    savedId = paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: true });
                 }
 
                 log.audit('Bill Payment Updated', {
@@ -1481,7 +1512,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         });
     }
 
-    function createBillPaymentJeAndApply(paymentId, jeAmount, paymentRef) {
+    function createBillPaymentJe(paymentId, jeAmount, paymentRef) {
         var paymentRecord = record.load({
             type: record.Type.VENDOR_PAYMENT,
             id: paymentId,
@@ -1528,7 +1559,6 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         });
 
         var jeId = jeRecord.save();
-        var savedPaymentId = applyBillPaymentToJe(paymentId, jeId, jeAmount);
 
         log.audit('Bill Payment JE Created', {
             paymentId: paymentId,
@@ -1536,7 +1566,6 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             paymentTotal: paymentTotal,
             jeAmount: jeAmount,
             journalId: jeId,
-            savedPaymentId: savedPaymentId,
             lines: jeLines
         });
 
@@ -1684,20 +1713,34 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         });
     }
 
-    function applyBillPaymentToJe(paymentId, jeId, jeAmount) {
-        var paymentRecord = record.load({
-            type: record.Type.VENDOR_PAYMENT,
-            id: paymentId,
-            isDynamic: false
-        });
+    function applyBillPaymentLineActions(paymentRecord, lineActions) {
         var lineCount = paymentRecord.getLineCount({ sublistId: 'apply' });
-        var appliedJe = false;
 
-        try {
-            paymentRecord.setValue({ fieldId: UNAPPLIED_DATE_FIELD, value: new Date() });
-        } catch (e) {
-            log.debug('Bill Payment Unapplied Date Not Set', e.message);
-        }
+        (lineActions || []).forEach(function (action) {
+            var line = Number(action.line);
+
+            if (line >= 0 && line < lineCount && String(paymentRecord.getSublistValue({
+                sublistId: 'apply',
+                fieldId: 'doc',
+                line: line
+            })) === String(action.billId)) {
+                paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: line, value: action.apply });
+                if (action.apply) paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: line, value: action.amount });
+                return;
+            }
+
+            for (var i = 0; i < lineCount; i++) {
+                if (String(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: i })) === String(action.billId)) {
+                    paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: action.apply });
+                    if (action.apply) paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i, value: action.amount });
+                    return;
+                }
+            }
+        });
+    }
+
+    function applyBillPaymentJeLine(paymentRecord, jeId, jeAmount) {
+        var lineCount = paymentRecord.getLineCount({ sublistId: 'apply' });
 
         for (var j = 0; j < lineCount; j++) {
             var internalId = String(paymentRecord.getSublistValue({
@@ -1716,20 +1759,15 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
 
                 try {
                     paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: j, value: jeAmount });
-                } catch (e2) {
-                    log.debug('Bill Payment JE Apply Amount Not Set', e2.message);
+                } catch (e) {
+                    log.debug('Bill Payment JE Apply Amount Not Set', e.message);
                 }
 
-                appliedJe = true;
-                break;
+                return true;
             }
         }
 
-        if (!appliedJe) {
-            throw new Error('Journal Entry ' + jeId + ' was not found on Bill Payment ' + paymentId + ' apply sublist.');
-        }
-
-        return paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: true });
+        throw new Error('Journal Entry ' + jeId + ' was not found on Bill Payment apply sublist.');
     }
 
     function isDuplicateFile(fileName) {

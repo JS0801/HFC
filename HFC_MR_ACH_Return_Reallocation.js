@@ -1,6 +1,7 @@
 /**
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
+ *
  */
 define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (file, search, record, format, runtime) {
     var RETURN_FOLDER_ID = '329224';

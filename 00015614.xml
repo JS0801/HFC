@@ -1,0 +1,182 @@
+<?xml version="1.0" standalone="no"?>
+
+<File PmtRecCount="3" PmtRecTotal='3600.19'>
+
+<PmtRec PmtCrDr="C" PmtMethod="DAC" PmtFormat="CCD">
+<OrgnrParty>
+<Name>
+<Name1>Organized Spaces, LLC</Name1>
+</Name>
+<PostAddr>
+<Addr1>19000 MacArthur Blvd Suite, 100</Addr1>
+<City>Irvine</City>
+<StateProv>CA</StateProv>
+<PostalCode>92612</PostalCode>
+<Country>US</Country>
+</PostAddr>
+</OrgnrParty>
+<RcvrParty>
+<Name>
+<Name1>Haynes and Boone, LLP</Name1>
+</Name>
+<RefInfo RefType="VN">
+<RefID>0180837294</RefID>
+</RefInfo>
+<PostAddr>
+<Addr1>Bank of America</Addr1>
+
+
+<City></City>
+<StateProv></StateProv>
+<PostalCode></PostalCode>
+<Country>US</Country>
+</PostAddr>
+</RcvrParty>
+<OrgnrDepAcctID>
+<DepAcctID AcctID="4144870722" AcctType="D">
+<BankInfo BankIDType="ABA">
+<BankID>121000248</BankID>
+</BankInfo>
+</DepAcctID>
+</OrgnrDepAcctID>
+
+<RcvrDepAcctID>
+<DepAcctID AcctID="0180837294" AcctType="D">
+<BankInfo BankIDType="ABA" Name="Advanta Clean Operating">
+<PostAddr>
+<Country>US</Country>
+</PostAddr>
+<BankID>111000025</BankID>
+</BankInfo>
+</DepAcctID>
+</RcvrDepAcctID>
+
+<PmtDetail>
+<InvoiceInfo InvoiceType="IV" InvoiceNum="VENDPYMT49707" EffDt='2026-07-14' TotalCurAmt='3240.49'>
+</InvoiceInfo>
+</PmtDetail>
+<PmtID>00015614/1</PmtID>
+<CurAmt>3240.49</CurAmt>
+<CurCode>USD</CurCode>
+<ValueDate>2026-07-14</ValueDate>
+</PmtRec>
+
+<PmtRec PmtCrDr="C" PmtMethod="DAC" PmtFormat="CCD">
+<OrgnrParty>
+<Name>
+<Name1>Organized Spaces, LLC</Name1>
+</Name>
+<PostAddr>
+<Addr1>19000 MacArthur Blvd Suite, 100</Addr1>
+<City>Irvine</City>
+<StateProv>CA</StateProv>
+<PostalCode>92612</PostalCode>
+<Country>US</Country>
+</PostAddr>
+</OrgnrParty>
+<RcvrParty>
+<Name>
+<Name1>Corporation Service Co</Name1>
+</Name>
+<RefInfo RefType="VN">
+<RefID>587326171</RefID>
+</RefInfo>
+<PostAddr>
+<Addr1></Addr1>
+
+
+<City></City>
+<StateProv></StateProv>
+<PostalCode></PostalCode>
+<Country>US</Country>
+</PostAddr>
+</RcvrParty>
+<OrgnrDepAcctID>
+<DepAcctID AcctID="4144870722" AcctType="D">
+<BankInfo BankIDType="ABA">
+<BankID>121000248</BankID>
+</BankInfo>
+</DepAcctID>
+</OrgnrDepAcctID>
+
+<RcvrDepAcctID>
+<DepAcctID AcctID="587326171" AcctType="D">
+<BankInfo BankIDType="ABA" Name="Advanta Clean Operating">
+<PostAddr>
+<Country>US</Country>
+</PostAddr>
+<BankID>021000021</BankID>
+</BankInfo>
+</DepAcctID>
+</RcvrDepAcctID>
+
+<PmtDetail>
+<InvoiceInfo InvoiceType="IV" InvoiceNum="VENDPYMT49708" EffDt='2026-07-14' TotalCurAmt='101.70'>
+</InvoiceInfo>
+</PmtDetail>
+<PmtID>00015614/2</PmtID>
+<CurAmt>101.70</CurAmt>
+<CurCode>USD</CurCode>
+<ValueDate>2026-07-14</ValueDate>
+</PmtRec>
+
+<PmtRec PmtCrDr="C" PmtMethod="DAC" PmtFormat="CCD">
+<OrgnrParty>
+<Name>
+<Name1>Organized Spaces, LLC</Name1>
+</Name>
+<PostAddr>
+<Addr1>19000 MacArthur Blvd Suite, 100</Addr1>
+<City>Irvine</City>
+<StateProv>CA</StateProv>
+<PostalCode>92612</PostalCode>
+<Country>US</Country>
+</PostAddr>
+</OrgnrParty>
+<RcvrParty>
+<Name>
+<Name1>Snell &amp; Wilmer L.L</Name1>
+</Name>
+<RefInfo RefType="VN">
+<RefID>00005979</RefID>
+</RefInfo>
+<PostAddr>
+<Addr1></Addr1>
+
+
+<City></City>
+<StateProv></StateProv>
+<PostalCode></PostalCode>
+<Country>US</Country>
+</PostAddr>
+</RcvrParty>
+<OrgnrDepAcctID>
+<DepAcctID AcctID="4144870722" AcctType="D">
+<BankInfo BankIDType="ABA">
+<BankID>121000248</BankID>
+</BankInfo>
+</DepAcctID>
+</OrgnrDepAcctID>
+
+<RcvrDepAcctID>
+<DepAcctID AcctID="00005979" AcctType="D">
+<BankInfo BankIDType="ABA" Name="Advanta Clean Operating">
+<PostAddr>
+<Country>US</Country>
+</PostAddr>
+<BankID>122100024</BankID>
+</BankInfo>
+</DepAcctID>
+</RcvrDepAcctID>
+
+<PmtDetail>
+<InvoiceInfo InvoiceType="IV" InvoiceNum="VENDPYMT49709" EffDt='2026-07-14' TotalCurAmt='258.00'>
+</InvoiceInfo>
+</PmtDetail>
+<PmtID>00015614/3</PmtID>
+<CurAmt>258.00</CurAmt>
+<CurCode>USD</CurCode>
+<ValueDate>2026-07-14</ValueDate>
+</PmtRec>
+<FileInfoGrp FileDate='2026-07-14' FileControlNumber="00015614"/>
+</File>

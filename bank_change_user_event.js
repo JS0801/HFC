@@ -3,7 +3,7 @@
  * @NScriptType UserEventScript
  */
 define(['N/https'], function (https) {
-    var SUITELET_SCRIPT_ID = 'customscript_your_suitelet_script_id';
+    var SUITELET_SCRIPT_ID = 'customscript_hfc_sl_vendor_approval_help';
     var SUITELET_DEPLOYMENT_ID = 'customdeploy_your_suitelet_deploy_id';
 
     var FIELDS_TO_CHECK = [

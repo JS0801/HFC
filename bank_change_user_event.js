@@ -72,6 +72,7 @@ define(['N/https'], function (https) {
 
         for (var i = 0; i < FIELDS_TO_CHECK.length; i++) {
             var fieldId = FIELDS_TO_CHECK[i];
+            log.debug('fieldId', fieldId)
             var oldValue = oldRec.getValue({ fieldId: fieldId });
             var newValue = newRec.getValue({ fieldId: fieldId });
 

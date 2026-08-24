@@ -93,6 +93,8 @@ define(['N/https', 'N/log'], function (https, log) {
             return;
         }
 
+        log.debug('vendorId', vendorId)
+
         https.requestSuitelet({
             scriptId: SUITELET_SCRIPT_ID,
             deploymentId: SUITELET_DEPLOYMENT_ID,

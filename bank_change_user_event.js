@@ -4,7 +4,7 @@
  */
 define(['N/https'], function (https) {
     var SUITELET_SCRIPT_ID = 'customscript_hfc_sl_vendor_approval_help';
-    var SUITELET_DEPLOYMENT_ID = 'customdeploy_your_suitelet_deploy_id';
+    var SUITELET_DEPLOYMENT_ID = 'customdeploy_hfc_sl_vendor_approval_help';
 
     var FIELDS_TO_CHECK = [
         'custrecord_2663_entity_bank_type',

@@ -2,7 +2,7 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  */
-define(['N/https'], function (https) {
+define(['N/https', 'N/log'], function (https, log) {
     var SUITELET_SCRIPT_ID = 'customscript_hfc_sl_vendor_approval_help';
     var SUITELET_DEPLOYMENT_ID = 'customdeploy_hfc_sl_vendor_approval_help';
 

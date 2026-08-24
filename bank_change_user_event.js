@@ -65,7 +65,7 @@ define(['N/https', 'N/log'], function (https, log) {
     function afterSubmit(context) {
         log.debug('trigger')
         var newRec = context.newRecord;
-        if (context.type !== context.UserEventType.EDIT) {
+        if (context.type == context.UserEventType.EDIT) {
 
         var oldRec = context.oldRecord;
 

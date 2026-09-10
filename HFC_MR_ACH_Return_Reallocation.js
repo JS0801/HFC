@@ -433,7 +433,8 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             filters: [
                 ['type', 'anyof', 'CustPymt'],
                 'AND',
-                [BATCH_FIELD, 'noneof', '@NONE@'],
+                ['custbody_payment_process', 'is', 'T'],
+               // [BATCH_FIELD, 'noneof', '@NONE@'],
                 'AND',
                 ['trandate', 'within', 'daysago' + DAYS_BACK, 'daysago0'],
                 'AND',
@@ -453,7 +454,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         }), function (result) {
             var paymentId = String(result.getValue({ name: 'internalid' }));
             var ref = clean(result.getValue({ name: 'tranid' }));
-            var batchId = result.getValue({ name: BATCH_FIELD });
+            var batchId = result.getValue({ name: BATCH_FIELD }) || '11111';
             var customerId = result.getValue({ name: 'entity' });
             var accountId = result.getValue({ name: 'account' });
             var accountName = String(result.getText({ name: 'account' }) || '');

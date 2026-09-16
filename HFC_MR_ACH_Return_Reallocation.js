@@ -433,8 +433,8 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             filters: [
                 ['type', 'anyof', 'CustPymt'],
                 'AND',
-                ['custbody_payment_process', 'is', 'T'],
-               // [BATCH_FIELD, 'noneof', '@NONE@'],
+                // ['custbody_payment_process', 'is', 'T'],
+                [BATCH_FIELD, 'noneof', '@NONE@'],
                 'AND',
                 ['trandate', 'within', 'daysago' + DAYS_BACK, 'daysago0'],
                 'AND',

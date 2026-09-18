@@ -856,8 +856,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/redirect', 'N/search', 'N/record', 
             var mm = (d.getMonth() + 1);
             var dd = (d.getDate());
             var yyyy = d.getFullYear();
-           // return mm + '/' + dd + '/' + yyyy;
-          return '09/10/2026';
+         return mm + '/' + dd + '/' + yyyy;
         }
 
         return {

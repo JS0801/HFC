@@ -118,7 +118,7 @@ function customizeGlImpact(transactionRecord, standardLines, customLines, book) 
 
                 setCommonValues(
                     clearingCreditLine,
-                    adjustment.entityId,
+                    null,
                     adjustment.departmentId,
                     adjustment.classId,
                     adjustment.locationId,

@@ -120,17 +120,27 @@
           <label>Approve</label>
           <saverecordfirst>T</saverecordfirst>
           <initcondition>
-            <formula><![CDATA["User Role" IN ("Role1")]]></formula>
+            <formula><![CDATA["User" IN ("Employee1","Employee2","Employee3")]]></formula>
             <type>VISUAL_BUILDER</type>
             <parameters>
               <parameter>
-                <name>User Role</name>
-                <value>STDUSERROLE</value>
+                <name>User</name>
+                <value>STDUSERUSER</value>
               </parameter>
               <parameter>
-                <name>Role1</name>
-                <selectrecordtype>-118</selectrecordtype>
-                <value>ADMINISTRATOR</value>
+                <name>Employee1</name>
+                <selectrecordtype>-4</selectrecordtype>
+                <value>[ACCOUNT_SPECIFIC_VALUE]</value>
+              </parameter>
+              <parameter>
+                <name>Employee2</name>
+                <selectrecordtype>-4</selectrecordtype>
+                <value>[ACCOUNT_SPECIFIC_VALUE]</value>
+              </parameter>
+              <parameter>
+                <name>Employee3</name>
+                <selectrecordtype>-4</selectrecordtype>
+                <value>[ACCOUNT_SPECIFIC_VALUE]</value>
               </parameter>
             </parameters>
           </initcondition>
@@ -146,17 +156,27 @@
           <label>Reject</label>
           <saverecordfirst>T</saverecordfirst>
           <initcondition>
-            <formula><![CDATA["User Role" IN ("Role1")]]></formula>
+            <formula><![CDATA["User" IN ("Employee1","Employee2","Employee3")]]></formula>
             <type>VISUAL_BUILDER</type>
             <parameters>
               <parameter>
-                <name>User Role</name>
-                <value>STDUSERROLE</value>
+                <name>User</name>
+                <value>STDUSERUSER</value>
               </parameter>
               <parameter>
-                <name>Role1</name>
-                <selectrecordtype>-118</selectrecordtype>
-                <value>ADMINISTRATOR</value>
+                <name>Employee1</name>
+                <selectrecordtype>-4</selectrecordtype>
+                <value>[ACCOUNT_SPECIFIC_VALUE]</value>
+              </parameter>
+              <parameter>
+                <name>Employee2</name>
+                <selectrecordtype>-4</selectrecordtype>
+                <value>[ACCOUNT_SPECIFIC_VALUE]</value>
+              </parameter>
+              <parameter>
+                <name>Employee3</name>
+                <selectrecordtype>-4</selectrecordtype>
+                <value>[ACCOUNT_SPECIFIC_VALUE]</value>
               </parameter>
             </parameters>
           </initcondition>

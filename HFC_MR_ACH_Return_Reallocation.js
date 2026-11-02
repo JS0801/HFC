@@ -638,55 +638,29 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
     }
 
     function getRootCustomerId(customerId, cache) {
-        var path = [];
         var current = String(customerId);
-
-        while (!cache[current]) {
-            if (path.indexOf(current) !== -1) {
-                log.error('Customer Hierarchy Cycle', { startingCustomerId: customerId, repeatedCustomerId: current, path: path.concat(current) });
-                throw new Error('Customer hierarchy cycle: ' + path.concat(current).join(' -> '));
-            }
-            path.push(current);
-            var parent = search.lookupFields({ type: search.Type.CUSTOMER, id: current, columns: ['parent'] }).parent || [];
-            log.debug('Customer Hierarchy Lookup', {
-                startingCustomerId: customerId,
-                customerId: current,
-                parentLookup: parent,
-                path: path
-            });
-            if (!parent.length) break;
-            current = String(parent[0].value);
-        }
-
-        var root = cache[current] || current;
-        path.forEach(function (id) { cache[id] = root; });
-        log.debug('Customer Hierarchy Resolved', { startingCustomerId: customerId, rootCustomerId: root, path: path });
+        if (cache[current]) return cache[current];
+        var parentId = String(record.load({ type: record.Type.CUSTOMER, id: current, isDynamic: false })
+            .getValue({ fieldId: 'parent' }) || '');
+        var searchParent = search.lookupFields({ type: search.Type.CUSTOMER, id: current, columns: ['parent'] }).parent || [];
+        log.debug('Customer Parent Lookup', { customerId: current, recordParentId: parentId, searchParent: searchParent });
+        if (parentId === current) throw new Error('Customer ' + current + ' is its own parent.');
+        var root = parentId || current;
+        cache[current] = root;
+        log.debug('Customer Hierarchy Resolved', { customerId: current, rootCustomerId: root });
         return root;
     }
 
     function getCustomerFamilyIds(rootId) {
         var ids = [String(rootId)];
-        var seen = {};
-        seen[String(rootId)] = true;
-        var level = [String(rootId)];
-
-        while (level.length) {
-            var next = [];
-            runPaged(search.create({
-                type: search.Type.CUSTOMER,
-                filters: [['parent', 'anyof', level]],
-                columns: [search.createColumn({ name: 'internalid', sort: search.Sort.ASC })]
-            }), function (result) {
-                var id = String(result.getValue({ name: 'internalid' }));
-                if (!seen[id]) {
-                    seen[id] = true;
-                    ids.push(id);
-                    next.push(id);
-                }
-            });
-            level = next;
-        }
-
+        runPaged(search.create({
+            type: search.Type.CUSTOMER,
+            filters: [['parent', 'anyof', rootId]],
+            columns: [search.createColumn({ name: 'internalid', sort: search.Sort.ASC })]
+        }), function (result) {
+            var id = String(result.getValue({ name: 'internalid' }));
+            if (ids.indexOf(id) === -1) ids.push(id);
+        });
         log.debug('Customer Family Discovered', { rootCustomerId: rootId, customerIds: ids });
         return ids;
     }

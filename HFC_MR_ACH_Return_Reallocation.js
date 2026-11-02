@@ -631,11 +631,14 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         var current = String(customerId);
 
         while (!cache[current]) {
-            if (path.indexOf(current) !== -1) throw new Error('Customer hierarchy cycle at ' + current);
-            path.push(current);
+            if (path.indexOf(current) == -1) {
+              path.push(current);
             var parent = search.lookupFields({ type: search.Type.CUSTOMER, id: current, columns: ['parent'] }).parent || [];
+              log.debug('parent', parent)
             if (!parent.length) break;
             current = String(parent[0].value);
+            }
+            
         }
 
         var root = cache[current] || current;

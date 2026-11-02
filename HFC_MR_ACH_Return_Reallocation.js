@@ -13,6 +13,8 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
     var NAF_SEQ_FIELD = 'custitem_naf_seq';
     var VOID_MEMO_TEXT = 'ACH RETURN VOIDED';
     var CUSTOMER_JE_MEMO_TEXT = 'ACH Return Payment Offset';
+    var NEW_PAYMENT_MEMO_TEXT = 'ACH Return Reallocation';
+    var JE_INVOICE_FIELD = 'custbody_ns_acs_created_from';
     var AP_MEMO_TEXT = 'NSF Bill Payment Reversal';
     var UNAPPLIED_DATE_FIELD = 'custbody_datetimeunapplied';
     var PROCESS_CUSTOMER = 'CUSTOMER_PAYMENT';
@@ -84,6 +86,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             if (tran.processType === PROCESS_CUSTOMER) {
                 failed.paymentRef = tran.tranId || ref;
                 failed.csvPaymentRef = ref;
+                failed.paymentId = tran.paymentId;
                 customerFailedLookup[failed.paymentRef] = failed;
             } else if (tran.processType === PROCESS_BILL) {
                 billPaymentArray.push({
@@ -105,6 +108,15 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         }
 
         var customerPaymentArray = buildCustomerPaymentGroups(customerFailedLookup, fileObj.id, fileObj.name);
+        var familyDimensions = {};
+        customerPaymentArray.forEach(function (group) {
+            var familyKey = [group.customerId, group.currencyId, group.subsidiaryId, group.arAccountId].join('_');
+            if (familyDimensions[familyKey]) {
+                throw new Error('Multiple returned groups share the same customer family and accounting dimensions: ' +
+                    familyDimensions[familyKey] + ' and ' + group.key + '. Open invoices cannot be allocated independently.');
+            }
+            familyDimensions[familyKey] = group.key;
+        });
         var output = customerPaymentArray.concat(billPaymentArray);
 
         log.audit('ACH Return Input Prepared', {
@@ -424,8 +436,22 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         var failedRefs = Object.keys(customerFailedLookup);
         var groups = {};
         var foundFailedRefs = {};
+        var customerRoots = {};
+        var paymentHeaders = {};
+        var batchIds = {};
 
         if (!failedRefs.length) return [];
+
+        failedRefs.forEach(function (ref) {
+            var failedPayment = record.load({
+                type: record.Type.CUSTOMER_PAYMENT,
+                id: customerFailedLookup[ref].paymentId,
+                isDynamic: false
+            });
+            var batchId = failedPayment.getValue({ fieldId: BATCH_FIELD });
+            if (!batchId) throw new Error('Failed Customer Payment ' + customerFailedLookup[ref].paymentId + ' has no PFA record.');
+            batchIds[String(batchId)] = true;
+        });
 
         runPaged(search.create({
             type: 'customerpayment',
@@ -434,37 +460,56 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                 ['type', 'anyof', 'CustPymt'],
                 'AND',
                 // ['custbody_payment_process', 'is', 'T'],
-                [BATCH_FIELD, 'noneof', '@NONE@'],
+                [BATCH_FIELD, 'anyof', Object.keys(batchIds)],
                 'AND',
                 ['trandate', 'within', 'daysago' + DAYS_BACK, 'daysago0'],
                 'AND',
                 ['appliedtotransaction.type', 'anyof', 'CustInvc']
             ],
             columns: [
-                'internalid',
+                search.createColumn({ name: 'internalid', sort: search.Sort.ASC }),
                 'tranid',
                 'trandate',
                 BATCH_FIELD,
                 'entity',
                 'account',
-                'amount',
-                'appliedtotransaction',
-                'appliedtolinkamount'
+                'fxamount',
+                'memo',
+                search.createColumn({ name: 'appliedtotransaction', sort: search.Sort.ASC }),
+                'appliedtoforeignamount'
             ]
         }), function (result) {
             var paymentId = String(result.getValue({ name: 'internalid' }));
             var ref = clean(result.getValue({ name: 'tranid' }));
-            var batchId = result.getValue({ name: BATCH_FIELD }) || '11111';
+            var batchId = result.getValue({ name: BATCH_FIELD });
             var customerId = result.getValue({ name: 'entity' });
             var accountId = result.getValue({ name: 'account' });
             var accountName = String(result.getText({ name: 'account' }) || '');
-            var paymentAmount = Math.abs(money(result.getValue({ name: 'amount' })));
+            var memo = String(result.getValue({ name: 'memo' }) || '');
+            var paymentAmount = Math.abs(money(result.getValue({ name: 'fxamount' })));
             var invoiceId = result.getValue({ name: 'appliedtotransaction' });
-            var appliedAmount = Math.abs(money(result.getValue({ name: 'appliedtolinkamount' })));
+            var appliedAmount = Math.abs(money(result.getValue({ name: 'appliedtoforeignamount' })));
             var failed = customerFailedLookup[ref];
-            var key = [batchId, customerId, accountId].join('_');
+            if (memo.indexOf(NEW_PAYMENT_MEMO_TEXT) !== -1) {
+                throw new Error('Previously created reallocation payment ' + paymentId + ' exists in this PFA. Review before rerunning.');
+            }
 
             if (!paymentId || !batchId || !customerId || !accountId || !paymentAmount || !invoiceId || !appliedAmount) return;
+
+            if (!paymentHeaders[paymentId]) {
+                var paymentRecord = record.load({ type: record.Type.CUSTOMER_PAYMENT, id: paymentId, isDynamic: false });
+                paymentHeaders[paymentId] = {
+                    currencyId: String(paymentRecord.getValue({ fieldId: 'currency' }) || ''),
+                    subsidiaryId: String(paymentRecord.getValue({ fieldId: 'subsidiary' }) || ''),
+                    arAccountId: String(paymentRecord.getValue({ fieldId: 'aracct' }) || '')
+                };
+            }
+            var header = paymentHeaders[paymentId];
+            if (!header.currencyId || !header.subsidiaryId || !header.arAccountId) {
+                throw new Error('Missing currency, subsidiary, or A/R account on Customer Payment ' + paymentId);
+            }
+            var rootCustomerId = getRootCustomerId(customerId, customerRoots);
+            var key = [batchId, rootCustomerId, accountId, header.currencyId, header.subsidiaryId, header.arAccountId].join('_');
 
             if (!groups[key]) {
                 groups[key] = {
@@ -473,9 +518,12 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                     fileName: fileName,
                     key: key,
                     batchId: String(batchId),
-                    customerId: String(customerId),
+                    customerId: String(rootCustomerId),
                     accountId: String(accountId),
                     accountName: accountName,
+                    currencyId: header.currencyId,
+                    subsidiaryId: header.subsidiaryId,
+                    arAccountId: header.arAccountId,
                     passedPayments: [],
                     failedPayments: [],
                     totals: {
@@ -495,6 +543,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                     paymentId: paymentId,
                     paymentRef: ref,
                     paymentDate: result.getValue({ name: 'trandate' }),
+                    customerId: String(customerId),
                     amount: paymentAmount,
                     appliedInvoices: []
                 };
@@ -536,9 +585,23 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
 
             if (!group.failedPayments.length) return list;
 
+            Object.keys(group.paymentMap).forEach(function (paymentId) {
+                var payment = group.paymentMap[paymentId];
+                var applied = payment.appliedInvoices.reduce(function (total, invoice) {
+                    return round(total + invoice.appliedAmount);
+                }, 0);
+                if (Math.abs(applied - payment.amount) > 0.009) {
+                    throw new Error('Payment ' + paymentId + ' has applied invoice total ' + applied +
+                        ' but header amount ' + payment.amount + '. Manual review is required before reallocation.');
+                }
+            });
+
             group.totals.failedAmount = group.failedPayments.reduce(function (total, payment) {
                 return round(total + money(payment.returnedAmount));
             }, 0);
+            if (group.totals.failedAmount > group.totals.batchAmount + 0.009) {
+                throw new Error('Returned amount exceeds batch payment amount for group ' + group.key);
+            }
             group.totals.availableAmount = Math.max(0, round(group.totals.batchAmount - group.totals.failedAmount));
 
             prepareCustomerAllocation(group);
@@ -563,17 +626,119 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         return output;
     }
 
+    function getRootCustomerId(customerId, cache) {
+        var path = [];
+        var current = String(customerId);
+
+        while (!cache[current]) {
+            if (path.indexOf(current) !== -1) throw new Error('Customer hierarchy cycle at ' + current);
+            path.push(current);
+            var parent = search.lookupFields({ type: search.Type.CUSTOMER, id: current, columns: ['parent'] }).parent || [];
+            if (!parent.length) break;
+            current = String(parent[0].value);
+        }
+
+        var root = cache[current] || current;
+        path.forEach(function (id) { cache[id] = root; });
+        return root;
+    }
+
+    function getCustomerFamilyIds(rootId) {
+        var ids = [String(rootId)];
+        var seen = {};
+        seen[String(rootId)] = true;
+        var level = [String(rootId)];
+
+        while (level.length) {
+            var next = [];
+            runPaged(search.create({
+                type: search.Type.CUSTOMER,
+                filters: [['parent', 'anyof', level]],
+                columns: [search.createColumn({ name: 'internalid', sort: search.Sort.ASC })]
+            }), function (result) {
+                var id = String(result.getValue({ name: 'internalid' }));
+                if (!seen[id]) {
+                    seen[id] = true;
+                    ids.push(id);
+                    next.push(id);
+                }
+            });
+            level = next;
+        }
+
+        return ids;
+    }
+
     function prepareCustomerAllocation(group) {
         var accountName = String(group.accountName || '');
         var itemSeqField = OPERATING_SEQ_FIELD;
         var invoiceAmounts = group.invoiceAmounts || {};
-        var invoiceIds = Object.keys(invoiceAmounts);
+        var originalIds = Object.keys(invoiceAmounts);
         var invoiceInfo = {};
+        var familyIds = getCustomerFamilyIds(group.customerId);
 
         if (accountName.indexOf('- NAF - USD -') !== -1 || accountName.indexOf('- NAF - CAD -') !== -1) {
             itemSeqField = NAF_SEQ_FIELD;
         }
 
+        function collectInvoice(result) {
+            var invoiceId = String(result.getValue({ name: 'internalid' }));
+            if (invoiceInfo[invoiceId]) return;
+            var invoiceRecord = record.load({ type: record.Type.INVOICE, id: invoiceId, isDynamic: false });
+            var customerId = String(invoiceRecord.getValue({ fieldId: 'entity' }) || '');
+            var currencyId = String(invoiceRecord.getValue({ fieldId: 'currency' }) || '');
+            var subsidiaryId = String(invoiceRecord.getValue({ fieldId: 'subsidiary' }) || '');
+            var arAccountId = String(invoiceRecord.getValue({ fieldId: 'account' }) || '');
+            var remainingAmount = money(invoiceRecord.getValue({ fieldId: 'amountremaining' }));
+
+            if (familyIds.indexOf(customerId) === -1) {
+                throw new Error('Invoice ' + invoiceId + ' is outside customer family ' + group.customerId);
+            }
+            if (currencyId !== group.currencyId || subsidiaryId !== group.subsidiaryId || arAccountId !== group.arAccountId) {
+                if (invoiceAmounts[invoiceId] !== undefined) {
+                    throw new Error('Applied invoice ' + invoiceId + ' has different currency, subsidiary, or A/R account from group ' + group.key);
+                }
+                return;
+            }
+
+            invoiceInfo[invoiceId] = {
+                invoiceId: invoiceId,
+                customerId: customerId,
+                invoiceNumber: result.getValue({ name: 'tranid' }),
+                invoiceDate: result.getValue({ name: 'trandate' }),
+                invoiceDateTime: dateTime(result.getValue({ name: 'trandate' })),
+                itemSequence: 999999999,
+                currentAmount: round((invoiceAmounts[invoiceId] || 0) + remainingAmount),
+                originallyApplied: invoiceAmounts[invoiceId] || 0
+            };
+        }
+
+        var invoiceColumns = [search.createColumn({ name: 'internalid', sort: search.Sort.ASC }),
+            'tranid', 'trandate'];
+
+        if (originalIds.length) {
+            runPaged(search.create({
+                type: search.Type.INVOICE,
+                filters: [['internalid', 'anyof', originalIds], 'AND', ['mainline', 'is', 'T']],
+                columns: invoiceColumns
+            }), collectInvoice);
+        }
+
+        runPaged(search.create({
+            type: search.Type.INVOICE,
+            filters: [
+                ['entity', 'anyof', familyIds], 'AND',
+                ['mainline', 'is', 'T'], 'AND',
+                ['amountremaining', 'greaterthan', '0']
+            ],
+            columns: invoiceColumns
+        }), collectInvoice);
+
+        originalIds.forEach(function (invoiceId) {
+            if (!invoiceInfo[invoiceId]) throw new Error('Applied invoice ' + invoiceId + ' could not be read for group ' + group.key);
+        });
+
+        var invoiceIds = Object.keys(invoiceInfo);
         if (invoiceIds.length) {
             runPaged(search.create({
                 type: search.Type.INVOICE,
@@ -601,31 +766,11 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
 
                 if (seqText === '' || seqText === null || isNaN(seq)) seq = 999999999;
 
-                if (!invoiceInfo[invoiceId]) {
-                    invoiceInfo[invoiceId] = {
-                        invoiceId: invoiceId,
-                        invoiceNumber: result.getValue({ name: 'tranid' }),
-                        invoiceDate: result.getValue({ name: 'trandate' }),
-                        invoiceDateTime: dateTime(result.getValue({ name: 'trandate' })),
-                        itemSequence: seq
-                    };
-                } else if (seq < invoiceInfo[invoiceId].itemSequence) {
+                if (invoiceInfo[invoiceId] && seq < invoiceInfo[invoiceId].itemSequence) {
                     invoiceInfo[invoiceId].itemSequence = seq;
                 }
             });
         }
-
-        invoiceIds.forEach(function (invoiceId) {
-            if (!invoiceInfo[invoiceId]) {
-                invoiceInfo[invoiceId] = {
-                    invoiceId: invoiceId,
-                    invoiceNumber: '',
-                    invoiceDate: '',
-                    invoiceDateTime: 9999999999999,
-                    itemSequence: 999999999
-                };
-            }
-        });
 
         invoiceIds.sort(function (a, b) {
             return invoiceInfo[a].invoiceDateTime - invoiceInfo[b].invoiceDateTime ||
@@ -639,7 +784,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         var details = [];
 
         invoiceIds.forEach(function (invoiceId) {
-            var currentAmount = invoiceAmounts[invoiceId];
+            var currentAmount = invoiceInfo[invoiceId].currentAmount;
             var desiredAmount = round(Math.min(currentAmount, remaining));
 
             desiredByInvoice[invoiceId] = desiredAmount;
@@ -651,15 +796,19 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
 
             details.push({
                 invoiceId: invoiceId,
+                customerId: invoiceInfo[invoiceId].customerId,
                 invoiceNumber: invoiceInfo[invoiceId].invoiceNumber,
                 invoiceDate: invoiceInfo[invoiceId].invoiceDate,
                 itemSequence: invoiceInfo[invoiceId].itemSequence,
                 currentAmount: currentAmount,
+                originallyApplied: invoiceInfo[invoiceId].originallyApplied,
                 desiredAmount: desiredAmount
             });
         });
 
         group.itemSeqField = itemSeqField;
+        group.familyIds = familyIds;
+        group.invoiceInfo = invoiceInfo;
         group.desiredByInvoice = desiredByInvoice;
         group.allocation = allocation;
         group.allocationDetails = details;
@@ -692,6 +841,79 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             desiredByInvoice[invoiceId] = group.desiredByInvoice[invoiceId];
         });
 
+        var jeTotal = 0;
+        var newPaymentTotal = 0;
+        var plannedNewByCustomer = {};
+        var projectedDesired = 0;
+
+        Object.keys(desiredByInvoice).forEach(function (invoiceId) {
+            var desired = desiredByInvoice[invoiceId];
+            var kept = round(Math.min(desired, group.invoiceAmounts[invoiceId] || 0));
+            var newAmount = round(desired - kept);
+            projectedDesired = round(projectedDesired + desired);
+            if (newAmount <= 0.009) return;
+            var customerId = group.invoiceInfo[invoiceId].customerId;
+            if (!plannedNewByCustomer[customerId]) plannedNewByCustomer[customerId] = [];
+            plannedNewByCustomer[customerId].push({ invoiceId: invoiceId, amount: newAmount });
+        });
+
+        if (Math.abs(round(group.totals.batchAmount - projectedDesired) - group.totals.failedAmount) > 0.009) {
+            throw new Error('Customer group ' + group.key + ' does not balance before edits.');
+        }
+
+        var projectedJournals = 0;
+        var remainingDesired = {};
+        Object.keys(desiredByInvoice).forEach(function (invoiceId) {
+            remainingDesired[invoiceId] = desiredByInvoice[invoiceId];
+        });
+        payments.forEach(function (payment) {
+            payment.appliedInvoices.forEach(function (entry) {
+                var retained = round(Math.min(entry.appliedAmount, remainingDesired[entry.invoiceId] || 0));
+                remainingDesired[entry.invoiceId] = round((remainingDesired[entry.invoiceId] || 0) - retained);
+                if (entry.appliedAmount - retained > 0.009) projectedJournals++;
+            });
+        });
+        var estimatedUsage = payments.length * 50 + projectedJournals * 90 +
+            Object.keys(plannedNewByCustomer).length * 50 + 100;
+        if (estimatedUsage > runtime.getCurrentScript().getRemainingUsage()) {
+            throw new Error('Customer group ' + group.key + ' needs approximately ' + estimatedUsage +
+                ' map usage units for ' + projectedJournals + ' invoice JEs; split this group before processing.');
+        }
+
+        Object.keys(plannedNewByCustomer).forEach(function (customerId) {
+            createReallocationPayment(group, customerId, plannedNewByCustomer[customerId], payments[0], false);
+        });
+
+        var paymentRecords = {};
+        payments.forEach(function (payment) {
+            var paymentRecord = record.load({
+                type: record.Type.CUSTOMER_PAYMENT,
+                id: payment.paymentId,
+                isDynamic: false
+            });
+            var expected = {};
+            payment.appliedInvoices.forEach(function (entry) {
+                expected[entry.invoiceId] = round((expected[entry.invoiceId] || 0) + entry.appliedAmount);
+            });
+            if (Math.abs(money(paymentRecord.getValue({ fieldId: 'payment' })) - payment.amount) > 0.009) {
+                throw new Error('Customer Payment ' + payment.paymentId + ' amount changed after input preparation.');
+            }
+            for (var line = 0; line < paymentRecord.getLineCount({ sublistId: 'apply' }); line++) {
+                if (!paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'apply', line: line })) continue;
+                var invoiceId = String(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: line }) || '');
+                var currentAmount = money(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'amount', line: line }));
+                if (!expected[invoiceId] || expected[invoiceId] + 0.009 < currentAmount) {
+                    throw new Error('Customer Payment ' + payment.paymentId + ' applications changed after input preparation.');
+                }
+                expected[invoiceId] = round(expected[invoiceId] - currentAmount);
+                if (expected[invoiceId] <= 0.009) delete expected[invoiceId];
+            }
+            if (Object.keys(expected).length) {
+                throw new Error('Customer Payment ' + payment.paymentId + ' is missing expected invoice applications.');
+            }
+            paymentRecords[payment.paymentId] = paymentRecord;
+        });
+
         log.audit('Customer Group Start', {
             key: group.key,
             batchId: group.batchId,
@@ -706,19 +928,13 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         });
 
         payments.forEach(function (payment) {
-            var paymentRecord = record.load({
-                type: record.Type.CUSTOMER_PAYMENT,
-                id: payment.paymentId,
-                isDynamic: false
-            });
+            var paymentRecord = paymentRecords[payment.paymentId];
             var lineCount = paymentRecord.getLineCount({ sublistId: 'apply' });
             var bodyPaymentBefore = money(paymentRecord.getValue({ fieldId: 'payment' }));
             var changed = false;
             var hadGroupApply = false;
             var keptGroupAmount = 0;
-            var outsideAmount = 0;
-            var appliedBefore = 0;
-            var hasOutsideApply = false;
+            var removed = [];
 
             log.debug('Customer Payment Edit Start', {
                 paymentId: payment.paymentId,
@@ -726,16 +942,6 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                 bodyPaymentBefore: bodyPaymentBefore,
                 lineCount: lineCount
             });
-
-            for (var beforeLine = 0; beforeLine < lineCount; beforeLine++) {
-                if (paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'apply', line: beforeLine })) {
-                    appliedBefore = round(appliedBefore + money(paymentRecord.getSublistValue({
-                        sublistId: 'apply',
-                        fieldId: 'amount',
-                        line: beforeLine
-                    })));
-                }
-            }
 
             for (var i = 0; i < lineCount; i++) {
                 var applied = paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i });
@@ -747,16 +953,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                 invoiceId = String(invoiceId);
 
                 if ((group.invoiceAmounts || {})[invoiceId] === undefined) {
-                    hasOutsideApply = true;
-                    outsideAmount = round(outsideAmount + currentAmount);
-                    log.debug('Customer Apply Line Outside Group', {
-                        paymentId: payment.paymentId,
-                        paymentRef: payment.paymentRef,
-                        line: i,
-                        invoiceId: invoiceId,
-                        currentAmount: currentAmount
-                    });
-                    continue;
+                    throw new Error('Unexpected applied transaction ' + invoiceId + ' on Customer Payment ' + payment.paymentId);
                 }
 
                 hadGroupApply = true;
@@ -767,6 +964,9 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
 
                 desiredByInvoice[invoiceId] = round((desiredByInvoice[invoiceId] || 0) - allowedAmount);
                 keptGroupAmount = round(keptGroupAmount + allowedAmount);
+                if (currentAmount - allowedAmount > 0.009) {
+                    removed.push({ invoiceId: invoiceId, amount: round(currentAmount - allowedAmount) });
+                }
 
                 if (allowedAmount > 0 && Math.abs(currentAmount - allowedAmount) > 0.009) {
                     paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: true });
@@ -792,24 +992,12 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                 });
             }
 
-            var targetAppliedAmount = round(keptGroupAmount + outsideAmount);
-            var jeAmount = hadGroupApply ? round(bodyPaymentBefore - targetAppliedAmount) : 0;
-            var returnJeId = '';
-
-            if (hadGroupApply && jeAmount > 0.009) {
-                changed = true;
-                log.debug('Customer Payment JE Needed', {
-                    paymentId: payment.paymentId,
-                    paymentRef: payment.paymentRef,
-                    bodyPaymentBefore: bodyPaymentBefore,
-                    targetAppliedAmount: targetAppliedAmount,
-                    keptGroupAmount: keptGroupAmount,
-                    outsideAmount: outsideAmount,
-                    jeAmount: jeAmount
-                });
+            var removedTotal = removed.reduce(function (total, entry) { return round(total + entry.amount); }, 0);
+            if (Math.abs(bodyPaymentBefore - keptGroupAmount - removedTotal) > 0.009) {
+                throw new Error('Customer Payment ' + payment.paymentId + ' does not reconcile before JE creation.');
             }
 
-            if (hadGroupApply && keptGroupAmount <= 0 && !hasOutsideApply) {
+            if (hadGroupApply && keptGroupAmount <= 0) {
                 var memo = String(paymentRecord.getValue({ fieldId: 'memo' }) || '');
 
                 if (memo.indexOf(VOID_MEMO_TEXT) === -1) {
@@ -826,27 +1014,23 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                     paymentId: payment.paymentId,
                     paymentRef: payment.paymentRef,
                     bodyPaymentBefore: bodyPaymentBefore,
-                    targetAppliedAmount: targetAppliedAmount,
-                    jeAmount: jeAmount,
-                    appliedBefore: appliedBefore,
                     keptGroupAmount: keptGroupAmount,
-                    outsideAmount: outsideAmount,
-                    hadGroupApply: hadGroupApply,
-                    hasOutsideApply: hasOutsideApply
+                    removed: removed
                 });
 
                 var savedId = paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: true });
 
-                if (jeAmount > 0.009) {
-                    returnJeId = createCustomerPaymentJeAndApply(savedId, jeAmount, payment.paymentRef);
-
-                    log.audit('Customer Payment JE Applied', {
+                removed.forEach(function (entry) {
+                    var journalId = createCustomerPaymentJeAndApply(savedId, entry.amount, payment.paymentRef, entry.invoiceId);
+                    jeTotal = round(jeTotal + entry.amount);
+                    log.audit('Customer Invoice JE Applied', {
                         paymentId: savedId,
                         paymentRef: payment.paymentRef,
-                        journalId: returnJeId,
-                        jeAmount: jeAmount
+                        invoiceId: entry.invoiceId,
+                        journalId: journalId,
+                        jeAmount: entry.amount
                     });
-                }
+                });
 
                 var savedRecord = record.load({
                     type: record.Type.CUSTOMER_PAYMENT,
@@ -866,48 +1050,116 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                     }
                 }
 
+                if (Math.abs(money(savedRecord.getValue({ fieldId: 'payment' })) - bodyPaymentBefore) > 0.009) {
+                    throw new Error('Customer Payment ' + savedId + ' header amount changed unexpectedly.');
+                }
+
                 log.audit('Customer Payment Updated', {
                     paymentId: payment.paymentId,
                     paymentRef: payment.paymentRef,
                     keptAmount: keptGroupAmount,
                     bodyPaymentBefore: bodyPaymentBefore,
-                    targetAppliedAmount: targetAppliedAmount,
                     savedBodyPayment: money(savedRecord.getValue({ fieldId: 'payment' })),
                     savedAppliedAmount: savedApplied,
-                    returnJeId: returnJeId,
-                    memoVoided: hadGroupApply && keptGroupAmount <= 0 && !hasOutsideApply
+                    jeCount: removed.length,
+                    memoVoided: hadGroupApply && keptGroupAmount <= 0
                 });
             } else {
                 log.debug('Customer Payment No Change', {
                     paymentId: payment.paymentId,
                     paymentRef: payment.paymentRef,
                     bodyPaymentBefore: bodyPaymentBefore,
-                    appliedBefore: appliedBefore,
-                    keptGroupAmount: keptGroupAmount,
-                    outsideAmount: outsideAmount,
-                    hadGroupApply: hadGroupApply,
-                    hasOutsideApply: hasOutsideApply
+                    keptGroupAmount: keptGroupAmount
                 });
             }
         });
 
-        var desiredLeft = Object.keys(desiredByInvoice).filter(function (invoiceId) {
-            return Math.abs(desiredByInvoice[invoiceId]) > 0.009;
-        }).map(function (invoiceId) {
-            return {
-                invoiceId: invoiceId,
-                amountLeft: desiredByInvoice[invoiceId]
-            };
+        var newByCustomer = {};
+        Object.keys(desiredByInvoice).forEach(function (invoiceId) {
+            var amount = round(desiredByInvoice[invoiceId]);
+            if (amount <= 0.009) return;
+            var customerId = group.invoiceInfo[invoiceId].customerId;
+            if (!newByCustomer[customerId]) newByCustomer[customerId] = [];
+            newByCustomer[customerId].push({ invoiceId: invoiceId, amount: amount });
         });
+
+        Object.keys(newByCustomer).forEach(function (customerId) {
+            var newPaymentId = createReallocationPayment(group, customerId, newByCustomer[customerId], payments[0], true);
+            var amount = newByCustomer[customerId].reduce(function (total, entry) {
+                return round(total + entry.amount);
+            }, 0);
+            newPaymentTotal = round(newPaymentTotal + amount);
+            log.audit('Customer Reallocation Payment Created', {
+                key: group.key,
+                customerId: customerId,
+                paymentId: newPaymentId,
+                amount: amount,
+                invoices: newByCustomer[customerId]
+            });
+        });
+
+        if (Math.abs(round(jeTotal - newPaymentTotal) - group.totals.failedAmount) > 0.009) {
+            throw new Error('Group ' + group.key + ' does not reconcile: JE ' + jeTotal +
+                ', new payments ' + newPaymentTotal + ', failed ' + group.totals.failedAmount);
+        }
 
         log.audit('Customer Group Complete', {
             key: group.key,
-            desiredLeftCount: desiredLeft.length,
-            desiredLeft: desiredLeft.slice(0, 25)
+            journalsAmount: jeTotal,
+            newPaymentsAmount: newPaymentTotal,
+            failedAmount: group.totals.failedAmount
         });
     }
 
-    function createCustomerPaymentJeAndApply(paymentId, jeAmount, paymentRef) {
+    function createReallocationPayment(group, customerId, invoices, sourcePayment, saveRecord) {
+        var amount = invoices.reduce(function (total, entry) { return round(total + entry.amount); }, 0);
+        var paymentRecord = record.transform({
+            fromType: record.Type.CUSTOMER,
+            fromId: customerId,
+            toType: record.Type.CUSTOMER_PAYMENT,
+            isDynamic: false
+        });
+        var date = new Date(dateTime(sourcePayment.paymentDate));
+        if (isNaN(date.getTime())) throw new Error('Invalid source payment date for ' + sourcePayment.paymentId);
+
+        paymentRecord.setValue({ fieldId: 'subsidiary', value: group.subsidiaryId });
+        paymentRecord.setValue({ fieldId: 'currency', value: group.currencyId });
+        paymentRecord.setValue({ fieldId: 'aracct', value: group.arAccountId });
+        paymentRecord.setValue({ fieldId: 'undepfunds', value: false });
+        paymentRecord.setValue({ fieldId: 'account', value: group.accountId });
+        paymentRecord.setValue({ fieldId: 'trandate', value: date });
+        paymentRecord.setValue({ fieldId: BATCH_FIELD, value: group.batchId });
+        paymentRecord.setValue({ fieldId: 'autoapply', value: false });
+        paymentRecord.setValue({ fieldId: 'payment', value: amount });
+        paymentRecord.setValue({ fieldId: 'memo', value: NEW_PAYMENT_MEMO_TEXT + ' | PFA ' + group.batchId +
+            ' | Source Payment ' + sourcePayment.paymentId });
+
+        var needed = {};
+        invoices.forEach(function (entry) { needed[entry.invoiceId] = entry.amount; });
+        var lineCount = paymentRecord.getLineCount({ sublistId: 'apply' });
+
+        for (var i = 0; i < lineCount; i++) {
+            var invoiceId = String(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: i }) || '');
+            if (!needed[invoiceId]) {
+                if (paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i })) {
+                    paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: false });
+                }
+                continue;
+            }
+            paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: true });
+            paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i, value: needed[invoiceId] });
+            delete needed[invoiceId];
+        }
+
+        if (Object.keys(needed).length) {
+            throw new Error('Invoices ' + Object.keys(needed).join(', ') +
+                ' were not available on transformed Customer Payment for customer ' + customerId);
+        }
+
+        return saveRecord ? paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: false }) : null;
+    }
+
+    function createCustomerPaymentJeAndApply(paymentId, jeAmount, paymentRef, invoiceId) {
         var paymentHeader = record.load({
             type: record.Type.CUSTOMER_PAYMENT,
             id: paymentId,
@@ -1013,6 +1265,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         if (currencyId) jeRecord.setValue({ fieldId: 'currency', value: currencyId });
         jeRecord.setValue({ fieldId: 'approvalstatus', value: 2 });
         jeRecord.setValue({ fieldId: 'memo', value: memoText });
+        jeRecord.setValue({ fieldId: JE_INVOICE_FIELD, value: invoiceId });
 
         jeLines.forEach(function (line) {
             if (!line.account || (!line.debit && !line.credit)) return;

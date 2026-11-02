@@ -483,8 +483,6 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             var ref = clean(result.getValue({ name: 'tranid' }));
             var batchId = result.getValue({ name: BATCH_FIELD });
             var customerId = result.getValue({ name: 'entity' });
-            var accountId = result.getValue({ name: 'account' });
-            var accountName = String(result.getText({ name: 'account' }) || '');
             var memo = String(result.getValue({ name: 'memo' }) || '');
             var paymentAmount = Math.abs(money(result.getValue({ name: 'fxamount' })));
             var invoiceId = result.getValue({ name: 'appliedtotransaction' });
@@ -494,11 +492,13 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                 throw new Error('Previously created reallocation payment ' + paymentId + ' exists in this PFA. Review before rerunning.');
             }
 
-            if (!paymentId || !batchId || !customerId || !accountId || !paymentAmount || !invoiceId || !appliedAmount) return;
+            if (!paymentId || !batchId || !customerId || !paymentAmount || !invoiceId || !appliedAmount) return;
 
             if (!paymentHeaders[paymentId]) {
                 var paymentRecord = record.load({ type: record.Type.CUSTOMER_PAYMENT, id: paymentId, isDynamic: false });
                 paymentHeaders[paymentId] = {
+                    accountId: String(paymentRecord.getValue({ fieldId: 'account' }) || ''),
+                    accountName: String(paymentRecord.getText({ fieldId: 'account' }) || ''),
                     currencyId: String(paymentRecord.getValue({ fieldId: 'currency' }) || ''),
                     subsidiaryId: String(paymentRecord.getValue({ fieldId: 'subsidiary' }) || ''),
                     arAccountId: String(paymentRecord.getValue({ fieldId: 'aracct' }) || '')
@@ -508,7 +508,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                     paymentRef: ref,
                     batchId: batchId,
                     customerId: customerId,
-                    accountId: accountId,
+                    accountId: paymentHeaders[paymentId].accountId,
                     currencyId: paymentHeaders[paymentId].currencyId,
                     subsidiaryId: paymentHeaders[paymentId].subsidiaryId,
                     arAccountId: paymentHeaders[paymentId].arAccountId,
@@ -516,11 +516,11 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                 });
             }
             var header = paymentHeaders[paymentId];
-            if (!header.currencyId || !header.subsidiaryId || !header.arAccountId) {
-                throw new Error('Missing currency, subsidiary, or A/R account on Customer Payment ' + paymentId);
+            if (!header.accountId || !header.currencyId || !header.subsidiaryId || !header.arAccountId) {
+                throw new Error('Missing bank account, currency, subsidiary, or A/R account on Customer Payment ' + paymentId);
             }
             var rootCustomerId = getRootCustomerId(customerId, customerRoots);
-            var key = [batchId, rootCustomerId, accountId, header.currencyId, header.subsidiaryId, header.arAccountId].join('_');
+            var key = [batchId, rootCustomerId, header.accountId, header.currencyId, header.subsidiaryId, header.arAccountId].join('_');
 
             if (!groups[key]) {
                 groups[key] = {
@@ -530,8 +530,8 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                     key: key,
                     batchId: String(batchId),
                     customerId: String(rootCustomerId),
-                    accountId: String(accountId),
-                    accountName: accountName,
+                    accountId: header.accountId,
+                    accountName: header.accountName,
                     currencyId: header.currencyId,
                     subsidiaryId: header.subsidiaryId,
                     arAccountId: header.arAccountId,

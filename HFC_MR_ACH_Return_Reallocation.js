@@ -83,6 +83,19 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                 return;
             }
 
+            var paymentRecord = record.load({
+                type: tran.processType === PROCESS_CUSTOMER ? record.Type.CUSTOMER_PAYMENT : record.Type.VENDOR_PAYMENT,
+                id: tran.paymentId,
+                isDynamic: false
+            });
+            var paymentAmount = money(paymentRecord.getValue({
+                fieldId: tran.processType === PROCESS_CUSTOMER ? 'payment' : 'total'
+            }));
+            if (Math.abs(paymentAmount - failed.returnedAmount) > 0.009) {
+                inputErrors.push(ref + ' amount mismatch: CSV ' + failed.returnedAmount + ', payment ' + paymentAmount);
+                return;
+            }
+
             if (tran.processType === PROCESS_CUSTOMER) {
                 failed.paymentRef = tran.tranId || ref;
                 failed.csvPaymentRef = ref;
@@ -250,7 +263,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                     row: row.rowNumber,
                     amount: returnedAmount
                 });
-                return;
+                throw new Error('ACH Return payment reference missing on CSV row ' + row.rowNumber);
             }
 
             if (!paymentMap[paymentRef]) {

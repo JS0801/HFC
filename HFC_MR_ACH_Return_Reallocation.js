@@ -503,6 +503,17 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                     subsidiaryId: String(paymentRecord.getValue({ fieldId: 'subsidiary' }) || ''),
                     arAccountId: String(paymentRecord.getValue({ fieldId: 'aracct' }) || '')
                 };
+                log.debug('Customer Payment Group Source', {
+                    paymentId: paymentId,
+                    paymentRef: ref,
+                    batchId: batchId,
+                    customerId: customerId,
+                    accountId: accountId,
+                    currencyId: paymentHeaders[paymentId].currencyId,
+                    subsidiaryId: paymentHeaders[paymentId].subsidiaryId,
+                    arAccountId: paymentHeaders[paymentId].arAccountId,
+                    failed: !!failed
+                });
             }
             var header = paymentHeaders[paymentId];
             if (!header.currencyId || !header.subsidiaryId || !header.arAccountId) {
@@ -631,18 +642,25 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         var current = String(customerId);
 
         while (!cache[current]) {
-            if (path.indexOf(current) == -1) {
-              path.push(current);
+            if (path.indexOf(current) !== -1) {
+                log.error('Customer Hierarchy Cycle', { startingCustomerId: customerId, repeatedCustomerId: current, path: path.concat(current) });
+                throw new Error('Customer hierarchy cycle: ' + path.concat(current).join(' -> '));
+            }
+            path.push(current);
             var parent = search.lookupFields({ type: search.Type.CUSTOMER, id: current, columns: ['parent'] }).parent || [];
-              log.debug('parent', parent)
+            log.debug('Customer Hierarchy Lookup', {
+                startingCustomerId: customerId,
+                customerId: current,
+                parentLookup: parent,
+                path: path
+            });
             if (!parent.length) break;
             current = String(parent[0].value);
-            }
-            
         }
 
         var root = cache[current] || current;
         path.forEach(function (id) { cache[id] = root; });
+        log.debug('Customer Hierarchy Resolved', { startingCustomerId: customerId, rootCustomerId: root, path: path });
         return root;
     }
 
@@ -669,6 +687,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             level = next;
         }
 
+        log.debug('Customer Family Discovered', { rootCustomerId: rootId, customerIds: ids });
         return ids;
     }
 

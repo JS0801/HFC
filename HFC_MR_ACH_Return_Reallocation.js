@@ -1029,14 +1029,14 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
 
                 var savedId = paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: true });
 
-                removed.forEach(function (entry) {
-                    var journalId = createCustomerPaymentJeAndApply(savedId, entry.amount, payment.paymentRef, entry.invoiceId);
+                var journals = removed.length ? createCustomerPaymentJesAndApply(savedId, removed, payment.paymentRef, paymentRecord) : [];
+                journals.forEach(function (entry) {
                     jeTotal = round(jeTotal + entry.amount);
                     log.audit('Customer Invoice JE Applied', {
                         paymentId: savedId,
                         paymentRef: payment.paymentRef,
                         invoiceId: entry.invoiceId,
-                        journalId: journalId,
+                        journalId: entry.journalId,
                         jeAmount: entry.amount
                     });
                 });
@@ -1168,18 +1168,13 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         return saveRecord ? paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: false }) : null;
     }
 
-    function createCustomerPaymentJeAndApply(paymentId, jeAmount, paymentRef, invoiceId) {
-        var paymentHeader = record.load({
-            type: record.Type.CUSTOMER_PAYMENT,
-            id: paymentId,
-            isDynamic: false
-        });
+    function createCustomerPaymentJesAndApply(paymentId, removed, paymentRef, paymentHeader) {
         var customerId = paymentHeader.getValue({ fieldId: 'customer' }) || paymentHeader.getValue({ fieldId: 'entity' });
         var subsidiaryId = paymentHeader.getValue({ fieldId: 'subsidiary' });
         var currencyId = paymentHeader.getValue({ fieldId: 'currency' });
         var mainInfo = {};
         var lineMap = {};
-        var jeLines = [];
+        var sourceLines = [];
         var sourceDebitTotal = 0;
         var sourceCreditTotal = 0;
         var memoText = CUSTOMER_JE_MEMO_TEXT + ' - ' + paymentRef;
@@ -1241,7 +1236,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                     debit: 0,
                     credit: 0
                 };
-                jeLines.push(lineMap[key]);
+                sourceLines.push(lineMap[key]);
             }
 
             lineMap[key].sourceDebit = round(lineMap[key].sourceDebit + debitAmount);
@@ -1250,75 +1245,79 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             sourceCreditTotal = round(sourceCreditTotal + creditAmount);
         });
 
-        if (!jeLines.length) throw new Error('No non-main GL lines found for Customer Payment ' + paymentId);
+        if (!sourceLines.length) throw new Error('No non-main GL lines found for Customer Payment ' + paymentId);
 
-        scaleJeLines(jeLines, sourceDebitTotal, sourceCreditTotal, jeAmount);
-        balanceJeLines(jeLines, mainInfo);
-
-        log.debug('Customer Payment JE Lines Prepared', {
+        log.debug('Customer Payment JE Source Prepared', {
             paymentId: paymentId,
             paymentRef: paymentRef,
-            jeAmount: jeAmount,
+            invoices: removed.length,
             mainInfo: mainInfo,
             sourceDebitTotal: sourceDebitTotal,
             sourceCreditTotal: sourceCreditTotal,
-            lines: jeLines
+            lines: sourceLines
         });
 
-        var jeRecord = record.create({
-            type: record.Type.JOURNAL_ENTRY,
-            isDynamic: true
+        var journals = removed.map(function (entry) {
+            var jeLines = sourceLines.map(function (line) { return Object.assign({}, line); });
+            scaleJeLines(jeLines, sourceDebitTotal, sourceCreditTotal, entry.amount);
+            balanceJeLines(jeLines, mainInfo);
+
+            var jeRecord = record.create({
+                type: record.Type.JOURNAL_ENTRY,
+                isDynamic: true
+            });
+
+            jeRecord.setValue({ fieldId: 'subsidiary', value: subsidiaryId });
+            if (currencyId) jeRecord.setValue({ fieldId: 'currency', value: currencyId });
+            jeRecord.setValue({ fieldId: 'approvalstatus', value: 2 });
+            jeRecord.setValue({ fieldId: 'memo', value: memoText });
+            jeRecord.setValue({ fieldId: JE_INVOICE_FIELD, value: entry.invoiceId });
+
+            jeLines.forEach(function (line) {
+                if (!line.account || (!line.debit && !line.credit)) return;
+
+                jeRecord.selectNewLine({ sublistId: 'line' });
+                jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'linesubsidiary', value: subsidiaryId });
+                jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'account', value: line.account });
+                jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'entity', value: line.entity || mainInfo.entity || customerId });
+                jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'memo', value: memoText });
+                if (line.department || mainInfo.department) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'department', value: line.department || mainInfo.department });
+                if (line.classId || mainInfo.classId) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'class', value: line.classId || mainInfo.classId });
+                if (line.location || mainInfo.location) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'location', value: line.location || mainInfo.location });
+                if (line.debit) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'debit', value: line.debit });
+                if (line.credit) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'credit', value: line.credit });
+                jeRecord.commitLine({ sublistId: 'line' });
+            });
+
+            return { invoiceId: entry.invoiceId, amount: entry.amount, journalId: jeRecord.save() };
         });
 
-        jeRecord.setValue({ fieldId: 'subsidiary', value: subsidiaryId });
-        if (currencyId) jeRecord.setValue({ fieldId: 'currency', value: currencyId });
-        jeRecord.setValue({ fieldId: 'approvalstatus', value: 2 });
-        jeRecord.setValue({ fieldId: 'memo', value: memoText });
-        jeRecord.setValue({ fieldId: JE_INVOICE_FIELD, value: invoiceId });
-
-        jeLines.forEach(function (line) {
-            if (!line.account || (!line.debit && !line.credit)) return;
-
-            jeRecord.selectNewLine({ sublistId: 'line' });
-            jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'linesubsidiary', value: subsidiaryId });
-            jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'account', value: line.account });
-            jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'entity', value: line.entity || mainInfo.entity || customerId });
-            jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'memo', value: memoText });
-            if (line.department || mainInfo.department) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'department', value: line.department || mainInfo.department });
-            if (line.classId || mainInfo.classId) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'class', value: line.classId || mainInfo.classId });
-            if (line.location || mainInfo.location) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'location', value: line.location || mainInfo.location });
-            if (line.debit) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'debit', value: line.debit });
-            if (line.credit) jeRecord.setCurrentSublistValue({ sublistId: 'line', fieldId: 'credit', value: line.credit });
-            jeRecord.commitLine({ sublistId: 'line' });
-        });
-
-        var jeId = jeRecord.save();
         var applyPayment = record.load({
             type: record.Type.CUSTOMER_PAYMENT,
             id: paymentId,
             isDynamic: false
         });
         var applyCount = applyPayment.getLineCount({ sublistId: 'apply' });
-        var appliedJe = false;
+        var remainingJournals = {};
+        journals.forEach(function (entry) { remainingJournals[String(entry.journalId)] = entry; });
 
         for (var i = 0; i < applyCount; i++) {
             var applyInternalId = String(applyPayment.getSublistValue({ sublistId: 'apply', fieldId: 'internalid', line: i }) || '');
             var applyDocId = String(applyPayment.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: i }) || '');
-
-            if (applyInternalId === String(jeId) || applyDocId === String(jeId)) {
-                applyPayment.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: true });
-                applyPayment.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i, value: jeAmount });
-                appliedJe = true;
-                break;
-            }
+            var journal = remainingJournals[applyInternalId] || remainingJournals[applyDocId];
+            if (!journal) continue;
+            applyPayment.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: true });
+            applyPayment.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i, value: journal.amount });
+            delete remainingJournals[String(journal.journalId)];
         }
 
-        if (!appliedJe) {
-            throw new Error('Journal Entry ' + jeId + ' was not found on Customer Payment ' + paymentId + ' apply sublist.');
+        if (Object.keys(remainingJournals).length) {
+            throw new Error('Journal Entries ' + Object.keys(remainingJournals).join(', ') +
+                ' were not found on Customer Payment ' + paymentId + ' apply sublist.');
         }
 
         applyPayment.save({ enableSourcing: false, ignoreMandatoryFields: true });
-        return jeId;
+        return journals;
     }
 
     function createBillPaymentJeAndApply(paymentId, returnedAmount, paymentRef) {

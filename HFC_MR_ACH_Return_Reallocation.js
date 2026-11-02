@@ -576,7 +576,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                         returnedAmount: failed.returnedAmount,
                         batchId: batchId,
                         customerId: customerId,
-                        accountId: accountId
+                        accountId: header.accountId
                     });
                 } else {
                     groups[key].passedPayments.push(payment);

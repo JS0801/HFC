@@ -482,7 +482,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             var paymentId = String(result.getValue({ name: 'internalid' }));
             var ref = clean(result.getValue({ name: 'tranid' }));
             var batchId = result.getValue({ name: BATCH_FIELD });
-            var customerId = result.getValue({ name: 'customer' });
+            var customerId = result.getValue({ name: 'entity' });
             var accountId = result.getValue({ name: 'account' });
             var accountName = String(result.getText({ name: 'account' }) || '');
             var memo = String(result.getValue({ name: 'memo' }) || '');

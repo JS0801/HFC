@@ -147,8 +147,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         var data = JSON.parse(context.value);
 
         if (data.processType === PROCESS_CUSTOMER) {
-            processCustomerPaymentGroup(data);
-            context.write({ key: 'fileId', value: data.fileId });
+            context.write({ key: data.key, value: context.value });
             return;
         }
 
@@ -171,6 +170,23 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         throw new Error('Unknown process type: ' + data.processType);
     }
 
+    function reduce(context) {
+        if (context.key === 'fileId') {
+            context.values.forEach(function (fileId) {
+                context.write({ key: 'fileId', value: fileId });
+            });
+            return;
+        }
+
+        if (context.values.length !== 1) throw new Error('Customer group ' + context.key + ' appeared more than once.');
+        var group = JSON.parse(context.values[0]);
+        if (group.processType !== PROCESS_CUSTOMER || group.key !== context.key) {
+            throw new Error('Invalid customer group for reduce key ' + context.key);
+        }
+        processCustomerPaymentGroup(group);
+        context.write({ key: 'fileId', value: group.fileId });
+    }
+
     function summarize(summary) {
         var hasErrors = false;
         var fileIds = {};
@@ -183,6 +199,12 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         summary.mapSummary.errors.iterator().each(function (key, errorText) {
             hasErrors = true;
             log.error('ACH Return Map Error', key + ': ' + errorText);
+            return true;
+        });
+
+        summary.reduceSummary.errors.iterator().each(function (key, errorText) {
+            hasErrors = true;
+            log.error('ACH Return Reduce Error', key + ': ' + errorText);
             return true;
         });
 
@@ -343,6 +365,10 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
 
                 if (fallback) addTransactionMatch(tranLookup, ref, fallback);
             }
+            if (!tranLookup[ref]) {
+                var olderCustomerPayment = findTransactionByReference(ref, true);
+                if (olderCustomerPayment) addTransactionMatch(tranLookup, ref, olderCustomerPayment);
+            }
         });
 
         log.audit('ACH Return Transactions Identified', {
@@ -353,16 +379,15 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         return tranLookup;
     }
 
-    function findTransactionByReference(paymentRef) {
+    function findTransactionByReference(paymentRef, historicalCustomerOnly) {
         var results = search.create({
             type: 'transaction',
             settings: [{ name: 'consolidationtype', value: 'ACCTTYPE' }],
             filters: [
-                ['type', 'anyof', 'CustPymt', 'VendPymt'],
+                ['type', 'anyof'].concat(historicalCustomerOnly ? ['CustPymt'] : ['CustPymt', 'VendPymt']),
                 'AND',
                 ['mainline', 'is', 'T'],
-                'AND',
-                ['trandate', 'within', 'daysago' + DAYS_BACK, 'daysago0'],
+                ...(historicalCustomerOnly ? [] : ['AND', ['trandate', 'within', 'daysago' + DAYS_BACK, 'daysago0']]),
                 'AND',
                 [
                     ['numbertext', 'is', paymentRef],
@@ -447,206 +472,133 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
 
     function buildCustomerPaymentGroups(customerFailedLookup, fileId, fileName) {
         var failedRefs = Object.keys(customerFailedLookup);
-        var groups = {};
-        var foundFailedRefs = {};
-        var customerRoots = {};
-        var paymentHeaders = {};
-        var batchIds = {};
-
         if (!failedRefs.length) return [];
 
+        var batchIds = {};
+        var roots = {};
+        var targetKeys = {};
         failedRefs.forEach(function (ref) {
-            var failedPayment = record.load({
+            var payment = record.load({
                 type: record.Type.CUSTOMER_PAYMENT,
                 id: customerFailedLookup[ref].paymentId,
                 isDynamic: false
             });
-            var batchId = failedPayment.getValue({ fieldId: BATCH_FIELD });
+            var batchId = payment.getValue({ fieldId: BATCH_FIELD });
             if (!batchId) throw new Error('Failed Customer Payment ' + customerFailedLookup[ref].paymentId + ' has no PFA record.');
             batchIds[String(batchId)] = true;
+            var customerId = String(payment.getValue({ fieldId: 'customer' }) || payment.getValue({ fieldId: 'entity' }) || '');
+            var key = [batchId, getRootCustomerId(customerId, roots),
+                payment.getValue({ fieldId: 'account' }), payment.getValue({ fieldId: 'currency' }),
+                payment.getValue({ fieldId: 'subsidiary' }), payment.getValue({ fieldId: 'aracct' })].join('_');
+            targetKeys[key] = true;
         });
 
+        var groups = {};
+        var foundFailedRefs = {};
         runPaged(search.create({
             type: 'customerpayment',
             settings: [{ name: 'consolidationtype', value: 'ACCTTYPE' }],
             filters: [
-                ['type', 'anyof', 'CustPymt'],
-                'AND',
-                // ['custbody_payment_process', 'is', 'T'],
-                [BATCH_FIELD, 'anyof', Object.keys(batchIds)],
-                'AND',
-                ['trandate', 'within', 'daysago' + DAYS_BACK, 'daysago0'],
-                'AND',
-                ['appliedtotransaction.type', 'anyof', 'CustInvc']
+                ['type', 'anyof', 'CustPymt'], 'AND',
+                [BATCH_FIELD, 'anyof', Object.keys(batchIds)], 'AND',
+                ['mainline', 'is', 'T']
             ],
-            columns: [
-                search.createColumn({ name: 'internalid', sort: search.Sort.ASC }),
-                'tranid',
-                'trandate',
-                BATCH_FIELD,
-                'entity',
-                'account',
-                'fxamount',
-                'memo',
-                search.createColumn({ name: 'appliedtotransaction', sort: search.Sort.ASC }),
-                'appliedtoforeignamount'
-            ]
+            columns: ['internalid', 'tranid', 'trandate', BATCH_FIELD, 'entity']
         }), function (result) {
-            var paymentId = String(result.getValue({ name: 'internalid' }));
+            var paymentId = String(result.getValue({ name: 'internalid' }) || '');
             var ref = clean(result.getValue({ name: 'tranid' }));
-            var batchId = result.getValue({ name: BATCH_FIELD });
-            var customerId = result.getValue({ name: 'entity' });
-            var memo = String(result.getValue({ name: 'memo' }) || '');
-            var paymentAmount = Math.abs(money(result.getValue({ name: 'fxamount' })));
-            var invoiceId = result.getValue({ name: 'appliedtotransaction' });
-            var appliedAmount = Math.abs(money(result.getValue({ name: 'appliedtoforeignamount' })));
-            var failed = customerFailedLookup[ref];
-            if (memo.indexOf(NEW_PAYMENT_MEMO_TEXT) !== -1) {
-                throw new Error('Previously created reallocation payment ' + paymentId + ' exists in this PFA. Review before rerunning.');
+            var batchId = String(result.getValue({ name: BATCH_FIELD }) || '');
+            var customerId = String(result.getValue({ name: 'entity' }) || '');
+            if (!paymentId || !batchId || !customerId) return;
+
+            var paymentRecord = record.load({ type: record.Type.CUSTOMER_PAYMENT, id: paymentId, isDynamic: false });
+            var bankId = String(paymentRecord.getValue({ fieldId: 'account' }) || '');
+            var currencyId = String(paymentRecord.getValue({ fieldId: 'currency' }) || '');
+            var subsidiaryId = String(paymentRecord.getValue({ fieldId: 'subsidiary' }) || '');
+            var arAccountId = String(paymentRecord.getValue({ fieldId: 'aracct' }) || '');
+            var amount = money(paymentRecord.getValue({ fieldId: 'payment' }));
+            if (!bankId || !currencyId || !subsidiaryId || !arAccountId || !amount) {
+                throw new Error('Missing bank, currency, subsidiary, A/R account, or amount on payment ' + paymentId);
             }
 
-            if (!paymentId || !batchId || !customerId || !paymentAmount || !invoiceId || !appliedAmount) return;
-
-            if (!paymentHeaders[paymentId]) {
-                var paymentRecord = record.load({ type: record.Type.CUSTOMER_PAYMENT, id: paymentId, isDynamic: false });
-                paymentHeaders[paymentId] = {
-                    accountId: String(paymentRecord.getValue({ fieldId: 'account' }) || ''),
-                    accountName: String(paymentRecord.getText({ fieldId: 'account' }) || ''),
-                    currencyId: String(paymentRecord.getValue({ fieldId: 'currency' }) || ''),
-                    subsidiaryId: String(paymentRecord.getValue({ fieldId: 'subsidiary' }) || ''),
-                    arAccountId: String(paymentRecord.getValue({ fieldId: 'aracct' }) || '')
-                };
-                log.debug('Customer Payment Group Source', {
-                    paymentId: paymentId,
-                    paymentRef: ref,
-                    batchId: batchId,
-                    customerId: customerId,
-                    accountId: paymentHeaders[paymentId].accountId,
-                    currencyId: paymentHeaders[paymentId].currencyId,
-                    subsidiaryId: paymentHeaders[paymentId].subsidiaryId,
-                    arAccountId: paymentHeaders[paymentId].arAccountId,
-                    failed: !!failed
-                });
+            var rootId = getRootCustomerId(customerId, roots);
+            var key = [batchId, rootId, bankId, currencyId, subsidiaryId, arAccountId].join('_');
+            if (!targetKeys[key]) return;
+            var memo = String(paymentRecord.getValue({ fieldId: 'memo' }) || '');
+            if (memo.indexOf(NEW_PAYMENT_MEMO_TEXT) !== -1 || memo.indexOf(VOID_MEMO_TEXT) !== -1) {
+                throw new Error('PFA ' + batchId + ' has a previously reallocated payment ' + paymentId + '. Review before rerunning.');
             }
-            var header = paymentHeaders[paymentId];
-            if (!header.accountId || !header.currencyId || !header.subsidiaryId || !header.arAccountId) {
-                throw new Error('Missing bank account, currency, subsidiary, or A/R account on Customer Payment ' + paymentId);
-            }
-            var rootCustomerId = getRootCustomerId(customerId, customerRoots);
-            var key = [batchId, rootCustomerId, header.accountId, header.currencyId, header.subsidiaryId, header.arAccountId].join('_');
-
             if (!groups[key]) {
                 groups[key] = {
                     processType: PROCESS_CUSTOMER,
                     fileId: String(fileId),
                     fileName: fileName,
                     key: key,
-                    batchId: String(batchId),
-                    customerId: String(rootCustomerId),
-                    accountId: header.accountId,
-                    accountName: header.accountName,
-                    currencyId: header.currencyId,
-                    subsidiaryId: header.subsidiaryId,
-                    arAccountId: header.arAccountId,
-                    passedPayments: [],
-                    failedPayments: [],
-                    totals: {
-                        batchAmount: 0,
-                        failedAmount: 0,
-                        availableAmount: 0
-                    },
-                    invoiceAmounts: {},
-                    paymentMap: {}
+                    batchId: batchId,
+                    customerId: rootId,
+                    accountId: bankId,
+                    accountName: String(paymentRecord.getText({ fieldId: 'account' }) || ''),
+                    currencyId: currencyId,
+                    subsidiaryId: subsidiaryId,
+                    arAccountId: arAccountId,
+                    payments: [],
+                    totals: { batchAmount: 0, failedAmount: 0, availableAmount: 0 },
+                    invoiceAmounts: {}
                 };
             }
 
-            var payment = groups[key].paymentMap[paymentId];
-
-            if (!payment) {
-                payment = {
-                    paymentId: paymentId,
-                    paymentRef: ref,
-                    paymentDate: result.getValue({ name: 'trandate' }),
-                    customerId: String(customerId),
-                    amount: paymentAmount,
-                    appliedInvoices: []
-                };
-
-                groups[key].paymentMap[paymentId] = payment;
-                groups[key].totals.batchAmount = round(groups[key].totals.batchAmount + paymentAmount);
-
-                if (failed) {
-                    foundFailedRefs[failed.csvPaymentRef || ref] = true;
-                    payment.returnedAmount = failed.returnedAmount;
-                    payment.returnCode = failed.returnCode;
-                    payment.returnReason = failed.returnReason;
-                    groups[key].failedPayments.push(payment);
-
-                    log.debug('Customer Failed Payment Matched', {
-                        key: key,
-                        paymentId: paymentId,
-                        paymentRef: ref,
-                        returnedAmount: failed.returnedAmount,
-                        batchId: batchId,
-                        customerId: customerId,
-                        accountId: header.accountId
-                    });
-                } else {
-                    groups[key].passedPayments.push(payment);
-                }
+            var failed = customerFailedLookup[ref];
+            var appliedInvoices = [];
+            var appliedTotal = 0;
+            var lineCount = paymentRecord.getLineCount({ sublistId: 'apply' });
+            for (var line = 0; line < lineCount; line++) {
+                if (!paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'apply', line: line })) continue;
+                var invoiceId = String(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: line }) || '');
+                var appliedAmount = money(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'amount', line: line }));
+                if (!invoiceId || !appliedAmount) throw new Error('Invalid apply line on payment ' + paymentId);
+                appliedInvoices.push({ invoiceId: invoiceId, appliedAmount: appliedAmount });
+                appliedTotal = round(appliedTotal + appliedAmount);
+                groups[key].invoiceAmounts[invoiceId] = round((groups[key].invoiceAmounts[invoiceId] || 0) + appliedAmount);
+            }
+            if (Math.abs(amount - appliedTotal) > 0.009) {
+                throw new Error('Payment ' + paymentId + ' has ' + appliedTotal + ' applied, but its header amount is ' + amount);
             }
 
-            invoiceId = String(invoiceId);
-            payment.appliedInvoices.push({
-                invoiceId: invoiceId,
-                appliedAmount: appliedAmount
+            groups[key].payments.push({
+                paymentId: paymentId,
+                paymentRef: ref,
+                paymentDate: result.getValue({ name: 'trandate' }),
+                customerId: customerId,
+                amount: amount,
+                failed: !!failed,
+                appliedInvoices: appliedInvoices
             });
-            groups[key].invoiceAmounts[invoiceId] = round((groups[key].invoiceAmounts[invoiceId] || 0) + appliedAmount);
+            groups[key].totals.batchAmount = round(groups[key].totals.batchAmount + amount);
+            if (failed) {
+                foundFailedRefs[failed.csvPaymentRef || ref] = true;
+                groups[key].totals.failedAmount = round(groups[key].totals.failedAmount + failed.returnedAmount);
+            }
         });
 
-        var output = Object.keys(groups).reduce(function (list, key) {
+        var output = Object.keys(groups).filter(function (key) {
+            return groups[key].totals.failedAmount > 0;
+        }).map(function (key) {
             var group = groups[key];
-
-            if (!group.failedPayments.length) return list;
-
-            Object.keys(group.paymentMap).forEach(function (paymentId) {
-                var payment = group.paymentMap[paymentId];
-                var applied = payment.appliedInvoices.reduce(function (total, invoice) {
-                    return round(total + invoice.appliedAmount);
-                }, 0);
-                if (Math.abs(applied - payment.amount) > 0.009) {
-                    throw new Error('Payment ' + paymentId + ' has applied invoice total ' + applied +
-                        ' but header amount ' + payment.amount + '. Manual review is required before reallocation.');
-                }
-            });
-
-            group.totals.failedAmount = group.failedPayments.reduce(function (total, payment) {
-                return round(total + money(payment.returnedAmount));
-            }, 0);
-            if (group.totals.failedAmount > group.totals.batchAmount + 0.009) {
-                throw new Error('Returned amount exceeds batch payment amount for group ' + group.key);
-            }
-            group.totals.availableAmount = Math.max(0, round(group.totals.batchAmount - group.totals.failedAmount));
-
+            group.totals.availableAmount = round(group.totals.batchAmount - group.totals.failedAmount);
+            if (group.totals.availableAmount < 0) throw new Error('Returns exceed payment total in group ' + key);
             prepareCustomerAllocation(group);
-            delete group.paymentMap;
-            list.push(group);
-            return list;
-        }, []);
+            return group;
+        });
 
-        var unmatchedRefs = failedRefs.filter(function (ref) {
+        var unmatched = failedRefs.filter(function (ref) {
             return !foundFailedRefs[customerFailedLookup[ref].csvPaymentRef || ref];
         });
-
-        if (unmatchedRefs.length) {
-            throw new Error('Customer payments were found but not available in batch/apply search: ' + unmatchedRefs.slice(0, 25).join(', '));
-        }
+        if (unmatched.length) throw new Error('Failed customer payments missing from PFA search: ' + unmatched.join(', '));
 
         log.audit('Customer Return Groups Built', {
             groups: output.length,
-            unmatchedFailedRefs: unmatchedRefs
+            payments: output.reduce(function (n, group) { return n + group.payments.length; }, 0)
         });
-
         return output;
     }
 
@@ -655,12 +607,9 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         if (cache[current]) return cache[current];
         var parentId = String(record.load({ type: record.Type.CUSTOMER, id: current, isDynamic: false })
             .getValue({ fieldId: 'parent' }) || '');
-        var searchParent = search.lookupFields({ type: search.Type.CUSTOMER, id: current, columns: ['parent'] }).parent || [];
-        log.debug('Customer Parent Lookup', { customerId: current, recordParentId: parentId, searchParent: searchParent });
         if (parentId === current) throw new Error('Customer ' + current + ' is its own parent.');
         var root = parentId || current;
         cache[current] = root;
-        log.debug('Customer Hierarchy Resolved', { customerId: current, rootCustomerId: root });
         return root;
     }
 
@@ -839,61 +788,15 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
     }
 
     function processCustomerPaymentGroup(group) {
-        var desiredByInvoice = {};
-        var payments = group.passedPayments.concat(group.failedPayments).sort(function (a, b) {
+        var payments = group.payments.sort(function (a, b) {
             return dateTime(a.paymentDate) - dateTime(b.paymentDate) ||
                 String(a.paymentRef).localeCompare(String(b.paymentRef)) ||
                 Number(a.paymentId) - Number(b.paymentId);
         });
+        var sourceRecords = {};
+        var expectedTotal = 0;
+        var desiredTotal = 0;
 
-        Object.keys(group.desiredByInvoice || {}).forEach(function (invoiceId) {
-            desiredByInvoice[invoiceId] = group.desiredByInvoice[invoiceId];
-        });
-
-        var jeTotal = 0;
-        var newPaymentTotal = 0;
-        var plannedNewByCustomer = {};
-        var projectedDesired = 0;
-
-        Object.keys(desiredByInvoice).forEach(function (invoiceId) {
-            var desired = desiredByInvoice[invoiceId];
-            var kept = round(Math.min(desired, group.invoiceAmounts[invoiceId] || 0));
-            var newAmount = round(desired - kept);
-            projectedDesired = round(projectedDesired + desired);
-            if (newAmount <= 0.009) return;
-            var customerId = group.invoiceInfo[invoiceId].customerId;
-            if (!plannedNewByCustomer[customerId]) plannedNewByCustomer[customerId] = [];
-            plannedNewByCustomer[customerId].push({ invoiceId: invoiceId, amount: newAmount });
-        });
-
-        if (Math.abs(round(group.totals.batchAmount - projectedDesired) - group.totals.failedAmount) > 0.009) {
-            throw new Error('Customer group ' + group.key + ' does not balance before edits.');
-        }
-
-        var projectedJournals = 0;
-        var remainingDesired = {};
-        Object.keys(desiredByInvoice).forEach(function (invoiceId) {
-            remainingDesired[invoiceId] = desiredByInvoice[invoiceId];
-        });
-        payments.forEach(function (payment) {
-            payment.appliedInvoices.forEach(function (entry) {
-                var retained = round(Math.min(entry.appliedAmount, remainingDesired[entry.invoiceId] || 0));
-                remainingDesired[entry.invoiceId] = round((remainingDesired[entry.invoiceId] || 0) - retained);
-                if (entry.appliedAmount - retained > 0.009) projectedJournals++;
-            });
-        });
-        var estimatedUsage = payments.length * 50 + projectedJournals * 90 +
-            Object.keys(plannedNewByCustomer).length * 50 + 100;
-        if (estimatedUsage > runtime.getCurrentScript().getRemainingUsage()) {
-            throw new Error('Customer group ' + group.key + ' needs approximately ' + estimatedUsage +
-                ' map usage units for ' + projectedJournals + ' invoice JEs; split this group before processing.');
-        }
-
-        Object.keys(plannedNewByCustomer).forEach(function (customerId) {
-            createReallocationPayment(group, customerId, plannedNewByCustomer[customerId], payments[0], false);
-        });
-
-        var paymentRecords = {};
         payments.forEach(function (payment) {
             var paymentRecord = record.load({
                 type: record.Type.CUSTOMER_PAYMENT,
@@ -904,229 +807,118 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             payment.appliedInvoices.forEach(function (entry) {
                 expected[entry.invoiceId] = round((expected[entry.invoiceId] || 0) + entry.appliedAmount);
             });
-            if (Math.abs(money(paymentRecord.getValue({ fieldId: 'payment' })) - payment.amount) > 0.009) {
-                throw new Error('Customer Payment ' + payment.paymentId + ' amount changed after input preparation.');
+            if (String(paymentRecord.getValue({ fieldId: BATCH_FIELD }) || '') !== String(group.batchId) ||
+                String(paymentRecord.getValue({ fieldId: 'account' }) || '') !== String(group.accountId) ||
+                Math.abs(money(paymentRecord.getValue({ fieldId: 'payment' })) - payment.amount) > 0.009) {
+                throw new Error('Customer Payment ' + payment.paymentId + ' changed after input preparation.');
             }
             for (var line = 0; line < paymentRecord.getLineCount({ sublistId: 'apply' }); line++) {
                 if (!paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'apply', line: line })) continue;
-                var invoiceId = String(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: line }) || '');
-                var currentAmount = money(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'amount', line: line }));
-                if (!expected[invoiceId] || expected[invoiceId] + 0.009 < currentAmount) {
+                var docId = String(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: line }) || '');
+                var amount = money(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'amount', line: line }));
+                if (!expected[docId] || Math.abs(expected[docId] - amount) > 0.009) {
                     throw new Error('Customer Payment ' + payment.paymentId + ' applications changed after input preparation.');
                 }
-                expected[invoiceId] = round(expected[invoiceId] - currentAmount);
-                if (expected[invoiceId] <= 0.009) delete expected[invoiceId];
+                delete expected[docId];
             }
-            if (Object.keys(expected).length) {
-                throw new Error('Customer Payment ' + payment.paymentId + ' is missing expected invoice applications.');
-            }
-            paymentRecords[payment.paymentId] = paymentRecord;
+            if (Object.keys(expected).length) throw new Error('Customer Payment ' + payment.paymentId + ' is missing invoice applications.');
+            sourceRecords[payment.paymentId] = paymentRecord;
+            expectedTotal = round(expectedTotal + payment.amount);
         });
+
+        Object.keys(group.desiredByInvoice).forEach(function (invoiceId) {
+            desiredTotal = round(desiredTotal + group.desiredByInvoice[invoiceId]);
+        });
+        if (Math.abs(expectedTotal - group.totals.batchAmount) > 0.009 ||
+            desiredTotal > group.totals.availableAmount + 0.009 ||
+            Math.abs(round(expectedTotal - group.totals.availableAmount) - group.totals.failedAmount) > 0.009) {
+            throw new Error('Customer group ' + group.key + ' does not reconcile before edits.');
+        }
+        var estimatedUsage = payments.length * 75 +
+            payments.reduce(function (n, payment) { return n + payment.appliedInvoices.length; }, 0) * 90 + 100;
+        if (estimatedUsage > runtime.getCurrentScript().getRemainingUsage()) {
+            throw new Error('Customer group ' + group.key + ' may exceed map usage. Estimated ' + estimatedUsage +
+                ', remaining ' + runtime.getCurrentScript().getRemainingUsage());
+        }
 
         log.audit('Customer Group Start', {
             key: group.key,
-            batchId: group.batchId,
-            customerId: group.customerId,
-            accountId: group.accountId,
-            accountName: group.accountName,
-            itemSeqField: group.itemSeqField,
             payments: payments.length,
-            failedPayments: group.failedPayments.length,
-            availableAmount: group.totals.availableAmount,
+            failedPayments: payments.filter(function (payment) { return payment.failed; }).length,
+            invoiceJes: payments.reduce(function (n, payment) { return n + payment.appliedInvoices.length; }, 0),
+            batchAmount: expectedTotal,
+            failedAmount: group.totals.failedAmount,
+            masterAmount: group.totals.availableAmount,
             allocation: group.allocation
         });
 
+        var jeTotal = 0;
         payments.forEach(function (payment) {
-            var paymentRecord = paymentRecords[payment.paymentId];
-            var lineCount = paymentRecord.getLineCount({ sublistId: 'apply' });
-            var bodyPaymentBefore = money(paymentRecord.getValue({ fieldId: 'payment' }));
-            var changed = false;
-            var hadGroupApply = false;
-            var keptGroupAmount = 0;
-            var removed = [];
+            var removed = payment.appliedInvoices.map(function (entry) {
+                return { invoiceId: entry.invoiceId, amount: entry.appliedAmount };
+            });
+            var journals = createCustomerPaymentJes(payment.paymentId, removed, payment.paymentRef, sourceRecords[payment.paymentId]);
+            var journalById = {};
+            var originalById = {};
+            journals.forEach(function (entry) { journalById[String(entry.journalId)] = entry; });
+            removed.forEach(function (entry) { originalById[entry.invoiceId] = entry; });
 
-            log.debug('Customer Payment Edit Start', {
-                paymentId: payment.paymentId,
+            var edit = record.load({
+                type: record.Type.CUSTOMER_PAYMENT,
+                id: payment.paymentId,
+                isDynamic: false
+            });
+            for (var line = 0; line < edit.getLineCount({ sublistId: 'apply' }); line++) {
+                var docId = String(edit.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: line }) || '');
+                var internalId = String(edit.getSublistValue({ sublistId: 'apply', fieldId: 'internalid', line: line }) || '');
+                if (originalById[docId]) {
+                    edit.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: line, value: false });
+                    delete originalById[docId];
+                }
+                var journal = journalById[docId] || journalById[internalId];
+                if (journal) {
+                    edit.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: line, value: true });
+                    edit.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: line, value: journal.amount });
+                    delete journalById[String(journal.journalId)];
+                }
+            }
+            if (Object.keys(originalById).length || Object.keys(journalById).length) {
+                throw new Error('Payment ' + payment.paymentId + ' is missing invoice or JE lines; created JEs: ' +
+                    journals.map(function (entry) { return entry.journalId; }).join(', '));
+            }
+            var memo = String(edit.getValue({ fieldId: 'memo' }) || '');
+            edit.setValue({ fieldId: 'memo', value: memo ? memo + ' | ' + VOID_MEMO_TEXT : VOID_MEMO_TEXT });
+            var savedId = edit.save({ enableSourcing: false, ignoreMandatoryFields: true });
+            jeTotal = round(jeTotal + payment.amount);
+            log.audit('Customer Payment Offset', {
+                paymentId: savedId,
                 paymentRef: payment.paymentRef,
-                bodyPaymentBefore: bodyPaymentBefore,
-                lineCount: lineCount
-            });
-
-            for (var i = 0; i < lineCount; i++) {
-                var applied = paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i });
-                var invoiceId = paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: i });
-                var currentAmount = money(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i }));
-
-                if (!applied || !invoiceId || currentAmount <= 0) continue;
-
-                invoiceId = String(invoiceId);
-
-                if ((group.invoiceAmounts || {})[invoiceId] === undefined) {
-                    throw new Error('Unexpected applied transaction ' + invoiceId + ' on Customer Payment ' + payment.paymentId);
-                }
-
-                hadGroupApply = true;
-
-                var desiredBefore = desiredByInvoice[invoiceId] || 0;
-                var allowedAmount = round(Math.min(currentAmount, desiredBefore));
-                var lineChanged = false;
-
-                desiredByInvoice[invoiceId] = round((desiredByInvoice[invoiceId] || 0) - allowedAmount);
-                keptGroupAmount = round(keptGroupAmount + allowedAmount);
-                if (currentAmount - allowedAmount > 0.009) {
-                    removed.push({ invoiceId: invoiceId, amount: round(currentAmount - allowedAmount) });
-                }
-
-                if (allowedAmount > 0 && Math.abs(currentAmount - allowedAmount) > 0.009) {
-                    paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: true });
-                    paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i, value: allowedAmount });
-                    changed = true;
-                    lineChanged = true;
-                } else if (allowedAmount <= 0) {
-                    paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: false });
-                    changed = true;
-                    lineChanged = true;
-                }
-
-                log.debug('Customer Apply Line Decision', {
-                    paymentId: payment.paymentId,
-                    paymentRef: payment.paymentRef,
-                    line: i,
-                    invoiceId: invoiceId,
-                    currentAmount: currentAmount,
-                    desiredBefore: desiredBefore,
-                    allowedAmount: allowedAmount,
-                    desiredAfter: desiredByInvoice[invoiceId],
-                    lineChanged: lineChanged
-                });
-            }
-
-            var removedTotal = removed.reduce(function (total, entry) { return round(total + entry.amount); }, 0);
-            if (Math.abs(bodyPaymentBefore - keptGroupAmount - removedTotal) > 0.009) {
-                throw new Error('Customer Payment ' + payment.paymentId + ' does not reconcile before JE creation.');
-            }
-
-            if (hadGroupApply && keptGroupAmount <= 0) {
-                var memo = String(paymentRecord.getValue({ fieldId: 'memo' }) || '');
-
-                if (memo.indexOf(VOID_MEMO_TEXT) === -1) {
-                    paymentRecord.setValue({
-                        fieldId: 'memo',
-                        value: memo ? memo + ' | ' + VOID_MEMO_TEXT : VOID_MEMO_TEXT
-                    });
-                    changed = true;
-                }
-            }
-
-            if (changed) {
-                log.debug('Customer Payment Save Attempt', {
-                    paymentId: payment.paymentId,
-                    paymentRef: payment.paymentRef,
-                    bodyPaymentBefore: bodyPaymentBefore,
-                    keptGroupAmount: keptGroupAmount,
-                    removed: removed
-                });
-
-                var savedId = paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: true });
-
-                var journals = removed.length ? createCustomerPaymentJesAndApply(savedId, removed, payment.paymentRef, paymentRecord) : [];
-                journals.forEach(function (entry) {
-                    jeTotal = round(jeTotal + entry.amount);
-                    log.audit('Customer Invoice JE Applied', {
-                        paymentId: savedId,
-                        paymentRef: payment.paymentRef,
-                        invoiceId: entry.invoiceId,
-                        journalId: entry.journalId,
-                        jeAmount: entry.amount
-                    });
-                });
-
-                var savedRecord = record.load({
-                    type: record.Type.CUSTOMER_PAYMENT,
-                    id: savedId,
-                    isDynamic: false
-                });
-                var savedApplied = 0;
-                var savedLineCount = savedRecord.getLineCount({ sublistId: 'apply' });
-
-                for (var savedLine = 0; savedLine < savedLineCount; savedLine++) {
-                    if (savedRecord.getSublistValue({ sublistId: 'apply', fieldId: 'apply', line: savedLine })) {
-                        savedApplied = round(savedApplied + money(savedRecord.getSublistValue({
-                            sublistId: 'apply',
-                            fieldId: 'amount',
-                            line: savedLine
-                        })));
-                    }
-                }
-
-                if (Math.abs(money(savedRecord.getValue({ fieldId: 'payment' })) - bodyPaymentBefore) > 0.009) {
-                    throw new Error('Customer Payment ' + savedId + ' header amount changed unexpectedly.');
-                }
-
-                log.audit('Customer Payment Updated', {
-                    paymentId: payment.paymentId,
-                    paymentRef: payment.paymentRef,
-                    keptAmount: keptGroupAmount,
-                    bodyPaymentBefore: bodyPaymentBefore,
-                    savedBodyPayment: money(savedRecord.getValue({ fieldId: 'payment' })),
-                    savedAppliedAmount: savedApplied,
-                    jeCount: removed.length,
-                    memoVoided: hadGroupApply && keptGroupAmount <= 0
-                });
-            } else {
-                log.debug('Customer Payment No Change', {
-                    paymentId: payment.paymentId,
-                    paymentRef: payment.paymentRef,
-                    bodyPaymentBefore: bodyPaymentBefore,
-                    keptGroupAmount: keptGroupAmount
-                });
-            }
-        });
-
-        var newByCustomer = {};
-        Object.keys(desiredByInvoice).forEach(function (invoiceId) {
-            var amount = round(desiredByInvoice[invoiceId]);
-            if (amount <= 0.009) return;
-            var customerId = group.invoiceInfo[invoiceId].customerId;
-            if (!newByCustomer[customerId]) newByCustomer[customerId] = [];
-            newByCustomer[customerId].push({ invoiceId: invoiceId, amount: amount });
-        });
-
-        Object.keys(newByCustomer).forEach(function (customerId) {
-            var newPaymentId = createReallocationPayment(group, customerId, newByCustomer[customerId], payments[0], true);
-            var amount = newByCustomer[customerId].reduce(function (total, entry) {
-                return round(total + entry.amount);
-            }, 0);
-            newPaymentTotal = round(newPaymentTotal + amount);
-            log.audit('Customer Reallocation Payment Created', {
-                key: group.key,
-                customerId: customerId,
-                paymentId: newPaymentId,
-                amount: amount,
-                invoices: newByCustomer[customerId]
+                amount: payment.amount,
+                invoiceJes: journals
             });
         });
 
-        if (Math.abs(round(jeTotal - newPaymentTotal) - group.totals.failedAmount) > 0.009) {
-            throw new Error('Group ' + group.key + ' does not reconcile: JE ' + jeTotal +
-                ', new payments ' + newPaymentTotal + ', failed ' + group.totals.failedAmount);
+        var masterPaymentId = null;
+        if (group.totals.availableAmount > 0.009) {
+            masterPaymentId = createMasterPayment(group, payments[0]);
         }
-
         log.audit('Customer Group Complete', {
             key: group.key,
-            journalsAmount: jeTotal,
-            newPaymentsAmount: newPaymentTotal,
-            failedAmount: group.totals.failedAmount
+            offsetAmount: jeTotal,
+            failedAmount: group.totals.failedAmount,
+            masterPaymentId: masterPaymentId,
+            masterAmount: group.totals.availableAmount,
+            appliedToInvoices: desiredTotal,
+            unappliedAmount: round(group.totals.availableAmount - desiredTotal)
         });
     }
 
-    function createReallocationPayment(group, customerId, invoices, sourcePayment, saveRecord) {
-        var amount = invoices.reduce(function (total, entry) { return round(total + entry.amount); }, 0);
+    function createMasterPayment(group, sourcePayment) {
         var paymentRecord = record.transform({
             fromType: record.Type.CUSTOMER,
-            fromId: customerId,
+            fromId: group.customerId,
             toType: record.Type.CUSTOMER_PAYMENT,
-            isDynamic: false
+            isDynamic: true
         });
         var date = new Date(dateTime(sourcePayment.paymentDate));
         if (isNaN(date.getTime())) throw new Error('Invalid source payment date for ' + sourcePayment.paymentId);
@@ -1139,36 +931,55 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         paymentRecord.setValue({ fieldId: 'trandate', value: date });
         paymentRecord.setValue({ fieldId: BATCH_FIELD, value: group.batchId });
         paymentRecord.setValue({ fieldId: 'autoapply', value: false });
-        paymentRecord.setValue({ fieldId: 'payment', value: amount });
+        paymentRecord.setValue({ fieldId: 'payment', value: group.totals.availableAmount });
         paymentRecord.setValue({ fieldId: 'memo', value: NEW_PAYMENT_MEMO_TEXT + ' | PFA ' + group.batchId +
             ' | Source Payment ' + sourcePayment.paymentId });
 
         var needed = {};
-        invoices.forEach(function (entry) { needed[entry.invoiceId] = entry.amount; });
-        var lineCount = paymentRecord.getLineCount({ sublistId: 'apply' });
-
-        for (var i = 0; i < lineCount; i++) {
+        Object.keys(group.desiredByInvoice).forEach(function (invoiceId) {
+            if (group.desiredByInvoice[invoiceId] > 0.009) needed[invoiceId] = group.desiredByInvoice[invoiceId];
+        });
+        var applyLineCount = paymentRecord.getLineCount({ sublistId: 'apply' });
+        log.debug('Master Payment Apply Lines', {
+            key: group.key,
+            parentCustomerId: group.customerId,
+            arAccountId: group.arAccountId,
+            applyLineCount: applyLineCount,
+            neededInvoiceIds: Object.keys(needed)
+        });
+        for (var i = 0; i < applyLineCount; i++) {
             var invoiceId = String(paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: i }) || '');
-            if (!needed[invoiceId]) {
+            var amount = needed[invoiceId];
+            if (!amount) {
                 if (paymentRecord.getSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i })) {
-                    paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: false });
+                    paymentRecord.selectLine({ sublistId: 'apply', line: i });
+                    paymentRecord.setCurrentSublistValue({ sublistId: 'apply', fieldId: 'apply', value: false });
+                    paymentRecord.commitLine({ sublistId: 'apply' });
                 }
                 continue;
             }
-            paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: true });
-            paymentRecord.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i, value: needed[invoiceId] });
+            paymentRecord.selectLine({ sublistId: 'apply', line: i });
+            paymentRecord.setCurrentSublistValue({ sublistId: 'apply', fieldId: 'apply', value: true });
+            paymentRecord.setCurrentSublistValue({ sublistId: 'apply', fieldId: 'amount', value: amount });
+            paymentRecord.commitLine({ sublistId: 'apply' });
             delete needed[invoiceId];
         }
-
         if (Object.keys(needed).length) {
-            throw new Error('Invoices ' + Object.keys(needed).join(', ') +
-                ' were not available on transformed Customer Payment for customer ' + customerId);
+            throw new Error('Parent Customer Payment cannot see eligible invoices: ' + Object.keys(needed).join(', ') +
+                ' (parent ' + group.customerId + ', A/R ' + group.arAccountId + ', apply lines ' + applyLineCount + ')');
         }
-
-        return saveRecord ? paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: false }) : null;
+        var paymentId = paymentRecord.save({ enableSourcing: false, ignoreMandatoryFields: false });
+        log.audit('Master Customer Payment Created', {
+            key: group.key,
+            paymentId: paymentId,
+            parentCustomerId: group.customerId,
+            amount: group.totals.availableAmount,
+            invoiceAllocation: group.allocationDetails.filter(function (entry) { return entry.desiredAmount > 0.009; })
+        });
+        return paymentId;
     }
 
-    function createCustomerPaymentJesAndApply(paymentId, removed, paymentRef, paymentHeader) {
+    function createCustomerPaymentJes(paymentId, removed, paymentRef, paymentHeader) {
         var customerId = paymentHeader.getValue({ fieldId: 'customer' }) || paymentHeader.getValue({ fieldId: 'entity' });
         var subsidiaryId = paymentHeader.getValue({ fieldId: 'subsidiary' });
         var currencyId = paymentHeader.getValue({ fieldId: 'currency' });
@@ -1289,34 +1100,16 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
                 jeRecord.commitLine({ sublistId: 'line' });
             });
 
-            return { invoiceId: entry.invoiceId, amount: entry.amount, journalId: jeRecord.save() };
+            var journalId = jeRecord.save();
+            log.audit('Customer Invoice Offset JE Created', {
+                paymentId: paymentId,
+                invoiceId: entry.invoiceId,
+                amount: entry.amount,
+                journalId: journalId
+            });
+            return { invoiceId: entry.invoiceId, amount: entry.amount, journalId: journalId };
         });
 
-        var applyPayment = record.load({
-            type: record.Type.CUSTOMER_PAYMENT,
-            id: paymentId,
-            isDynamic: false
-        });
-        var applyCount = applyPayment.getLineCount({ sublistId: 'apply' });
-        var remainingJournals = {};
-        journals.forEach(function (entry) { remainingJournals[String(entry.journalId)] = entry; });
-
-        for (var i = 0; i < applyCount; i++) {
-            var applyInternalId = String(applyPayment.getSublistValue({ sublistId: 'apply', fieldId: 'internalid', line: i }) || '');
-            var applyDocId = String(applyPayment.getSublistValue({ sublistId: 'apply', fieldId: 'doc', line: i }) || '');
-            var journal = remainingJournals[applyInternalId] || remainingJournals[applyDocId];
-            if (!journal) continue;
-            applyPayment.setSublistValue({ sublistId: 'apply', fieldId: 'apply', line: i, value: true });
-            applyPayment.setSublistValue({ sublistId: 'apply', fieldId: 'amount', line: i, value: journal.amount });
-            delete remainingJournals[String(journal.journalId)];
-        }
-
-        if (Object.keys(remainingJournals).length) {
-            throw new Error('Journal Entries ' + Object.keys(remainingJournals).join(', ') +
-                ' were not found on Customer Payment ' + paymentId + ' apply sublist.');
-        }
-
-        applyPayment.save({ enableSourcing: false, ignoreMandatoryFields: true });
         return journals;
     }
 
@@ -1674,6 +1467,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
     return {
         getInputData: getInputData,
         map: map,
+        reduce: reduce,
         summarize: summarize
     };
 });

@@ -526,7 +526,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
             if (!targetKeys[key]) return;
             var memo = String(paymentRecord.getValue({ fieldId: 'memo' }) || '');
             if (memo.indexOf(NEW_PAYMENT_MEMO_TEXT) !== -1 || memo.indexOf(VOID_MEMO_TEXT) !== -1) {
-                throw new Error('PFA ' + batchId + ' has a previously reallocated payment ' + paymentId + '. Review before rerunning.');
+               // throw new Error('PFA ' + batchId + ' has a previously reallocated payment ' + paymentId + '. Review before rerunning.');
             }
             if (!groups[key]) {
                 groups[key] = {

@@ -914,6 +914,14 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
     }
 
     function createMasterPayment(group, sourcePayment) {
+        var bankDetailsId = record.load({ type: 'customrecord_2663_file_admin', id: group.batchId })
+            .getValue({ fieldId: 'custrecord_2663_bank_account' });
+        if (!bankDetailsId) throw new Error('PFA ' + group.batchId + ' has no bank account.');
+        var accountId = record.load({ type: 'customrecord_2663_bank_details', id: bankDetailsId })
+            .getValue({ fieldId: 'custrecord_2663_gl_bank_account' });
+        if (String(accountId || '') !== String(group.accountId)) {
+            throw new Error('PFA ' + group.batchId + ' GL bank account does not match group ' + group.key);
+        }
         var paymentRecord = record.transform({
             fromType: record.Type.CUSTOMER,
             fromId: group.customerId,
@@ -926,8 +934,7 @@ define(['N/file', 'N/search', 'N/record', 'N/format', 'N/runtime'], function (fi
         paymentRecord.setValue({ fieldId: 'subsidiary', value: group.subsidiaryId });
         paymentRecord.setValue({ fieldId: 'currency', value: group.currencyId });
         paymentRecord.setValue({ fieldId: 'aracct', value: group.arAccountId });
-        paymentRecord.setValue({ fieldId: 'undepfunds', value: false });
-        paymentRecord.setValue({ fieldId: 'account', value: group.accountId });
+        paymentRecord.setValue({ fieldId: 'account', value: accountId });
         paymentRecord.setValue({ fieldId: 'trandate', value: date });
         paymentRecord.setValue({ fieldId: BATCH_FIELD, value: group.batchId });
         paymentRecord.setValue({ fieldId: 'autoapply', value: false });
